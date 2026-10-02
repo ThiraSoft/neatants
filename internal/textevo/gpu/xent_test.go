@@ -27,17 +27,29 @@ func TestFloatToHalf(t *testing.T) {
 }
 
 func TestXentMatchesCPU(t *testing.T) {
-	t.Run("scalar/D32", func(t *testing.T) { checkXent(t, 32, xentSPV, 64) })
-	t.Run("scalar/D128", func(t *testing.T) { checkXent(t, 128, xentSPV, 64) })
+	t.Run("scalar/D32", func(t *testing.T) { checkXent(t, 32, 0) })
+	t.Run("scalar/D128", func(t *testing.T) { checkXent(t, 128, 0) })
 	t.Run("coop/D128", func(t *testing.T) {
 		if !device(t).Coopmat() {
 			t.Skip("no cooperative matrices")
 		}
-		checkXent(t, 128, xentCoopSPV, xentCoopRows)
+		checkXent(t, 128, xentCoopWave)
 	})
 }
 
-func checkXent(t *testing.T, D int, spv []byte, tile int) {
+// At a wave width it was not written for, xent_coop would divide its rows
+// wrongly; it must say so with NaN on every row instead of returning scores.
+func TestXentCoopRefusesOtherWave(t *testing.T) {
+	if !device(t).Coopmat() {
+		t.Skip("no cooperative matrices")
+	}
+	checkXent(t, 128, 32)
+}
+
+// checkXent runs xent on random rows and compares with the CPU. wave 0 runs
+// the scalar kernel, xentCoopWave the matrix one as Evaluator builds it, and
+// any other wave the matrix one at that width, which must refuse.
+func checkXent(t *testing.T, D int, wave uint32) {
 	dev := device(t)
 	const R, V, scored, windows, warm, L = 1000, 300, 50, 5, 16, 66
 	genomes := R / (scored * windows)
@@ -83,19 +95,29 @@ func checkXent(t *testing.T, D int, spv []byte, tile int) {
 		t.Fatal(err)
 	}
 	defer out.Close()
-	pipe, err := dev.NewPipeline(spv, 5, 8*4)
+	coop, tile := wave != 0, 64
+	if coop {
+		tile = xentCoopRows
+	}
+	pipe, err := newXentPipe(dev, coop, wave)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer pipe.Close()
 	set, err := pipe.NewSet([]*vk.Buffer{genB, tokB, embB, rowsB, bitsB})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer set.Close()
 	push := xentPush{R, V, uint32(D), scored, windows, warm, uint32(gen.startsOff), uint32(gen.scaleOff)}
 	err = dev.Submit(func(r *vk.Recorder) {
 		r.Fill(bitsB, math.Float32bits(-7))
 		r.Barrier()
-		r.Dispatch(set, uint32((R+tile-1)/tile), unsafe.Pointer(&push))
+		if coop {
+			r.DispatchWide(set, 1, uint32((R+tile-1)/tile), unsafe.Pointer(&push))
+		} else {
+			r.Dispatch(set, uint32((R+tile-1)/tile), unsafe.Pointer(&push))
+		}
 		r.Barrier()
 		r.Copy(out, 0, bitsB, size)
 	})
@@ -103,6 +125,14 @@ func checkXent(t *testing.T, D int, spv []byte, tile int) {
 		t.Fatal(err)
 	}
 	got := unsafe.Slice((*float32)(unsafe.Pointer(&out.Bytes()[0])), R+64)
+	if coop && wave != xentCoopWave {
+		for r := range R {
+			if !math.IsNaN(float64(got[r])) {
+				t.Fatalf("wave %d: row %d scored %g instead of NaN", wave, r, got[r])
+			}
+		}
+		return
+	}
 	worst := 0.0
 	for r := range R {
 		p := r / scored

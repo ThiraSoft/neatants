@@ -88,14 +88,12 @@ func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
 	// The matrix cores take xent when the device has them and the embedding is
 	// the width the kernel was built for; NEATTEXT_SCALAR_XENT forces the
 	// scalar kernel, to compare the two.
-	spv := xentSPV
+	e.coop = d.Coopmat() && data.Dim == xentCoopDim && os.Getenv("NEATTEXT_SCALAR_XENT") == ""
 	e.xentRows = 64
-	if d.Coopmat() && data.Dim == xentCoopDim && os.Getenv("NEATTEXT_SCALAR_XENT") == "" {
-		spv = xentCoopSPV
-		e.coop = true
+	if e.coop {
 		e.xentRows = xentCoopRows
 	}
-	if e.xentPipe, err = d.NewPipeline(spv, 5, 8*4); err != nil {
+	if e.xentPipe, err = newXentPipe(d, e.coop, xentCoopWave); err != nil {
 		return nil, err
 	}
 	ok = true
@@ -276,7 +274,12 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 			r.Barrier()
 		}
 		if !e.skipXent {
-			r.Dispatch(e.xentSet[kind], uint32((rows+e.xentRows-1)/e.xentRows), unsafe.Pointer(&xp))
+			groups := uint32((rows + e.xentRows - 1) / e.xentRows)
+			if e.coop {
+				r.DispatchWide(e.xentSet[kind], 1, groups, unsafe.Pointer(&xp))
+			} else {
+				r.Dispatch(e.xentSet[kind], groups, unsafe.Pointer(&xp))
+			}
 		}
 	})
 	e.Timing.GPU = time.Since(start)
@@ -292,6 +295,11 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		sum := 0.0
 		for _, b := range bits[j*per : (j+1)*per] {
 			sum += float64(b)
+		}
+		if math.IsNaN(sum) {
+			// Only xent_coop writes NaN, when it runs at a wave width it
+			// was not written for; the scores would be meaningless.
+			return nil, 0, fmt.Errorf("gpu: xent returned NaN for genome %d: the matrix kernel ran at the wrong wave width, set NEATTEXT_SCALAR_XENT=1", i)
 		}
 		bpb[i] = sum / denom
 	}

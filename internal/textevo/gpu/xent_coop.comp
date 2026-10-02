@@ -56,9 +56,23 @@ const float LOG2E = 1.44269504088896340736;
 
 void main() {
 	uint tid = gl_LocalInvocationID.x;
+	// The rows are divided between four waves of sixty-four lanes, and the
+	// pipeline asks for that width (see New). A device that runs it at any
+	// other width would score the wrong rows, so the kernel refuses instead:
+	// every row it owns is NaN, which Evaluate reports as an error. The test
+	// is uniform over the workgroup, so the barriers below stay legal.
+	if (gl_SubgroupSize != 64u || gl_NumSubgroups != THREADS / 64u) {
+		for (uint q = tid; q < TR; q += THREADS)
+			if (gl_WorkGroupID.x * TR + q < pc.rows) bits[gl_WorkGroupID.x * TR + q] = uintBitsToFloat(0x7FC00000u);
+		return;
+	}
+	// The rows of a lane follow from its wave and its place in the wave, not
+	// from its index in the workgroup, which Vulkan does not tie to either.
 	uint wave = gl_SubgroupID;
+	uint lane = gl_SubgroupInvocationID;
+	uint slot = wave * 64u + lane;
 	uint r0 = gl_WorkGroupID.x * TR;
-	uint part = tid & 3u;
+	uint part = lane & 3u;
 	const uint wv = DIM / 8;
 
 	for (uint q = tid; q < TR * wv; q += THREADS) {
@@ -77,7 +91,7 @@ void main() {
 	// first lane of a row computes it.
 	float scale[RB], m[RB], s[RB], tg[RB];
 	[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
-		uint r = (wave * RB + ib) * 16u + ((tid & 63u) >> 2);
+		uint r = (wave * RB + ib) * 16u + (lane >> 2);
 		uint rr = min(r0 + r, pc.rows - 1u);
 		uint p = rr / pc.scored;
 		uint g = p / pc.windows, w = p % pc.windows;
@@ -123,7 +137,7 @@ void main() {
 		subgroupMemoryBarrierShared();
 		subgroupBarrier();
 		[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
-			uint r = (wave * RB + ib) * 16u + ((tid & 63u) >> 2);
+			uint r = (wave * RB + ib) * 16u + (lane >> 2);
 			// The raw products: the scale is positive, so the maximum
 			// commutes with it and is taken before it.
 			vec4 x[4];
@@ -152,15 +166,15 @@ void main() {
 
 	// Merge the four lanes of a row, which are consecutive lanes of one wave.
 	[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
-		uint r = (wave * RB + ib) * 16u + ((tid & 63u) >> 2);
+		uint r = (wave * RB + ib) * 16u + (lane >> 2);
 		float M = m[ib], T = tg[ib], S = s[ib];
 		for (uint o = 1u; o < 4u; o <<= 1u) {
 			// Shared memory stands in for a subgroup shuffle, to stay inside
 			// the extensions the device asks for.
 			barrier();
-			Ss[tid] = vec4(M, T, S, 0.0);
+			Ss[slot] = vec4(M, T, S, 0.0);
 			barrier();
-			vec4 o2 = Ss[tid ^ o];
+			vec4 o2 = Ss[slot ^ o];
 			float Mn = max(M, o2.x);
 			S = S * exp2(M - Mn) + o2.z * exp2(o2.x - Mn);
 			M = Mn;
