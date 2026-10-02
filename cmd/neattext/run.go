@@ -48,6 +48,12 @@ func runEvolve() {
 	if *warm >= *length {
 		fail(2, "-warm must be smaller than -len")
 	}
+	if *pop < 1 {
+		fail(2, "-pop must be at least 1")
+	}
+	if *windows < 1 {
+		fail(2, "-windows must be at least 1")
+	}
 	if *pop**windows > 65535 {
 		fail(2, "-pop times -windows must not exceed 65535, the Vulkan dispatch limit")
 	}
