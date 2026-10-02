@@ -14,14 +14,6 @@ import (
 
 func roundHalf(x float32) float32 { return halfToFloat(floatToHalf(x)) }
 
-func packHalves(x []float32) []uint32 {
-	w := make([]uint32, len(x)/2)
-	for i := range w {
-		w[i] = uint32(floatToHalf(x[2*i])) | uint32(floatToHalf(x[2*i+1]))<<16
-	}
-	return w
-}
-
 func TestFloatToHalf(t *testing.T) {
 	for _, x := range []float32{0, 1, -1, 0.5, 3.14159, -7.99, 1e-6, 65504, 0.000061} {
 		got := roundHalf(x)
