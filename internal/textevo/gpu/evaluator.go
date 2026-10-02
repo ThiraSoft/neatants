@@ -3,6 +3,7 @@ package gpu
 import (
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -39,6 +40,12 @@ type Evaluator struct {
 	// Timing is how the last Evaluate or Validate spent its time: packing the
 	// genomes on the CPU, the upload and the kernels, summing the bits.
 	Timing struct{ Pack, GPU, Sum time.Duration }
+
+	// skipNet and skipXent leave a kernel out of the submission, so that a
+	// benchmark can time the other one alone. Tests only.
+	skipNet, skipXent bool
+	// coop says that xent runs on the matrix cores.
+	coop bool
 }
 
 // New uploads the corpus and the embedding of data and builds the kernels.
@@ -72,7 +79,15 @@ func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
 	if e.netPipe, err = d.NewPipeline(netrunSPV, 4, 7*4); err != nil {
 		return nil, err
 	}
-	if e.xentPipe, err = d.NewPipeline(xentSPV, 5, 8*4); err != nil {
+	// The matrix cores take xent when the device has them and the embedding is
+	// the width the kernel was built for; NEATTEXT_SCALAR_XENT forces the
+	// scalar kernel, to compare the two.
+	spv := xentSPV
+	if d.Coopmat() && data.Dim == xentCoopDim && os.Getenv("NEATTEXT_SCALAR_XENT") == "" {
+		spv = xentCoopSPV
+		e.coop = true
+	}
+	if e.xentPipe, err = d.NewPipeline(spv, 5, 8*4); err != nil {
 		return nil, err
 	}
 	ok = true
@@ -265,9 +280,13 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 	err := e.d.Submit(func(r *vk.Recorder) {
 		r.Copy(e.gen, 0, e.up, genBytes)
 		r.TransferBarrier()
-		r.Dispatch(e.netSet[kind], uint32(pairs), unsafe.Pointer(&netPush))
-		r.Barrier()
-		r.Dispatch(e.xentSet[kind], uint32((rows+63)/64), unsafe.Pointer(&xp))
+		if !e.skipNet {
+			r.Dispatch(e.netSet[kind], uint32(pairs), unsafe.Pointer(&netPush))
+			r.Barrier()
+		}
+		if !e.skipXent {
+			r.Dispatch(e.xentSet[kind], uint32((rows+63)/64), unsafe.Pointer(&xp))
+		}
 	})
 	e.Timing.GPU = time.Since(start)
 	if err != nil {

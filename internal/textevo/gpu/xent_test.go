@@ -27,8 +27,19 @@ func TestFloatToHalf(t *testing.T) {
 }
 
 func TestXentMatchesCPU(t *testing.T) {
+	t.Run("scalar/D32", func(t *testing.T) { checkXent(t, 32, xentSPV) })
+	t.Run("scalar/D128", func(t *testing.T) { checkXent(t, 128, xentSPV) })
+	t.Run("coop/D128", func(t *testing.T) {
+		if !device(t).Coopmat() {
+			t.Skip("no cooperative matrices")
+		}
+		checkXent(t, 128, xentCoopSPV)
+	})
+}
+
+func checkXent(t *testing.T, D int, spv []byte) {
 	dev := device(t)
-	const R, V, D, scored, windows, warm, L = 1000, 300, 32, 50, 5, 16, 66
+	const R, V, scored, windows, warm, L = 1000, 300, 50, 5, 16, 66
 	genomes := R / (scored * windows)
 	d := model.Synthetic(V, D, 2000, 1)
 	for i := range d.E {
@@ -72,7 +83,7 @@ func TestXentMatchesCPU(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer out.Close()
-	pipe, err := dev.NewPipeline(xentSPV, 5, 8*4)
+	pipe, err := dev.NewPipeline(spv, 5, 8*4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +91,7 @@ func TestXentMatchesCPU(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	push := xentPush{R, V, D, scored, windows, warm, uint32(gen.startsOff), uint32(gen.scaleOff)}
+	push := xentPush{R, V, uint32(D), scored, windows, warm, uint32(gen.startsOff), uint32(gen.scaleOff)}
 	err = dev.Submit(func(r *vk.Recorder) {
 		r.Fill(bitsB, math.Float32bits(-7))
 		r.Barrier()
