@@ -93,6 +93,26 @@ It pays off with many worlds. On the author's machine (i7-9700K, RX 9070 XT, 500
 
 Networks compute in float32 on both the CPU and the GPU, so a lineage evolved on the GPU behaves the same in the game, give or take float rounding.
 
+## Text: NEAT predicting tokens
+
+`neattext` evolves small NEAT networks that read the Qwen3 embedding of a token and predict the next one on TinyShakespeare. A network outputs a vector, its score for each token is the dot product with the token's embedding, and fitness is the bits per byte of the real next token. A generation of 1000 networks on 4 windows each runs in one GPU submission.
+
+```sh
+make data                 # download the corpus
+make text
+./neattext -prep          # tokenize once, writes data/prep.bin
+./neattext -baselines
+./neattext -pop 200 -gens 12 -out runs/smoke
+./neattext -sample runs/smoke/champion.json -n 40
+./neattext -cpu -pop 20 -gens 2    # CPU reference, no Vulkan needed
+```
+
+Without `-gens` the run goes until Ctrl+C, which finishes the generation, validates and saves. Each run writes `run.csv` and `champion.json` in its directory under `runs/` (git-ignored). The champion is validated every 10 generations and saved when its validation score improves.
+
+Log columns: `gen`; `best_bpb` and `mean_bpb` of the training windows (the mean skips genomes too big for the kernel); `species`; `nodes`, `edges`, `memory` and `plastic` of the best genome (memory nodes, Hebbian links); `oversized` genomes scored as infinite; `eval_ms` and `total_ms` for the generation; `val_bpb` on 64 fixed validation windows of 512 tokens, only on validation generations.
+
+Reference points on the validation text: unigram 2.85 bits per byte, bigram 2.30, trigram 2.27. A char-rnn reaches about 1.5 bits per character. A 12 generation smoke run sits around 3.5 on the training windows and 3.8 on validation, so it starts above the unigram baseline.
+
 ## Configuration
 
 `config.yml` is commented. Main sections:
@@ -111,6 +131,8 @@ Networks compute in float32 on both the CPU and the GPU, so a lineage evolved on
 ```
 cmd/neatants/            game entry point
 cmd/neatants-headless/   headless evolution runner
+cmd/neattext/            text evolution: prep, baselines, run, sample
+internal/textevo/        text evolution packages (prep, model, ref, gpu, evo, baseline)
 neat/                    NEAT genomes, networks, crossover, speciation distance
 internal/sim/            the simulation (no Ebiten)
 internal/render/         Ebiten rendering, HUD, shaders
