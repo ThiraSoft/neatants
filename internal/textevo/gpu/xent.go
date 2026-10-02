@@ -15,3 +15,6 @@ type xentPush struct {
 
 // xentCoopDim is the embedding width xent_coop.comp is built for.
 const xentCoopDim = 128
+
+// xentCoopRows is how many rows one workgroup of xent_coop.comp covers.
+const xentCoopRows = 128

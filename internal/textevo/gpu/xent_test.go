@@ -27,17 +27,17 @@ func TestFloatToHalf(t *testing.T) {
 }
 
 func TestXentMatchesCPU(t *testing.T) {
-	t.Run("scalar/D32", func(t *testing.T) { checkXent(t, 32, xentSPV) })
-	t.Run("scalar/D128", func(t *testing.T) { checkXent(t, 128, xentSPV) })
+	t.Run("scalar/D32", func(t *testing.T) { checkXent(t, 32, xentSPV, 64) })
+	t.Run("scalar/D128", func(t *testing.T) { checkXent(t, 128, xentSPV, 64) })
 	t.Run("coop/D128", func(t *testing.T) {
 		if !device(t).Coopmat() {
 			t.Skip("no cooperative matrices")
 		}
-		checkXent(t, 128, xentCoopSPV)
+		checkXent(t, 128, xentCoopSPV, xentCoopRows)
 	})
 }
 
-func checkXent(t *testing.T, D int, spv []byte) {
+func checkXent(t *testing.T, D int, spv []byte, tile int) {
 	dev := device(t)
 	const R, V, scored, windows, warm, L = 1000, 300, 50, 5, 16, 66
 	genomes := R / (scored * windows)
@@ -95,7 +95,7 @@ func checkXent(t *testing.T, D int, spv []byte) {
 	err = dev.Submit(func(r *vk.Recorder) {
 		r.Fill(bitsB, math.Float32bits(-7))
 		r.Barrier()
-		r.Dispatch(set, (R+63)/64, unsafe.Pointer(&push))
+		r.Dispatch(set, uint32((R+tile-1)/tile), unsafe.Pointer(&push))
 		r.Barrier()
 		r.Copy(out, 0, bitsB, size)
 	})

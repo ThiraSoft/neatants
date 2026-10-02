@@ -46,6 +46,8 @@ type Evaluator struct {
 	skipNet, skipXent bool
 	// coop says that xent runs on the matrix cores.
 	coop bool
+	// xentRows is how many rows one workgroup of xent covers.
+	xentRows int
 }
 
 // New uploads the corpus and the embedding of data and builds the kernels.
@@ -83,9 +85,11 @@ func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
 	// the width the kernel was built for; NEATTEXT_SCALAR_XENT forces the
 	// scalar kernel, to compare the two.
 	spv := xentSPV
+	e.xentRows = 64
 	if d.Coopmat() && data.Dim == xentCoopDim && os.Getenv("NEATTEXT_SCALAR_XENT") == "" {
 		spv = xentCoopSPV
 		e.coop = true
+		e.xentRows = xentCoopRows
 	}
 	if e.xentPipe, err = d.NewPipeline(spv, 5, 8*4); err != nil {
 		return nil, err
@@ -262,9 +266,9 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		return nil, 0, fmt.Errorf("gpu: %d genomes x %d windows is %d pairs, over the %d workgroups of one dispatch: lower -pop or -windows",
 			len(fit), len(starts), pairs, maxGroups)
 	}
-	if (rows+63)/64 > maxGroups {
+	if (rows+e.xentRows-1)/e.xentRows > maxGroups {
 		return nil, 0, fmt.Errorf("gpu: %d rows to score, over what one dispatch of xent covers (%d): lower -pop, -windows or -len",
-			rows, 64*maxGroups)
+			rows, e.xentRows*maxGroups)
 	}
 
 	start = time.Now()
@@ -285,7 +289,7 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 			r.Barrier()
 		}
 		if !e.skipXent {
-			r.Dispatch(e.xentSet[kind], uint32((rows+63)/64), unsafe.Pointer(&xp))
+			r.Dispatch(e.xentSet[kind], uint32((rows+e.xentRows-1)/e.xentRows), unsafe.Pointer(&xp))
 		}
 	})
 	e.Timing.GPU = time.Since(start)

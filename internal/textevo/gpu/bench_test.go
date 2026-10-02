@@ -36,8 +36,8 @@ func benchGen(b *testing.B, make func(i int, dim int) *neat.Genome, mode string)
 		b.Fatal(err)
 	}
 	defer e.Close()
-	e.skipXent = mode == "net"
-	e.skipNet = mode == "xent"
+	e.skipXent = mode == "net" || mode == "none"
+	e.skipNet = mode == "xent" || mode == "none"
 	rng := rand.New(rand.NewSource(1))
 	b.ResetTimer()
 	var pack, gpu, sum time.Duration
@@ -69,3 +69,4 @@ func BenchmarkGenerationGen0(b *testing.B) { benchGen(b, gen0, "") }
 func BenchmarkNetrunGrown(b *testing.B)    { benchGen(b, grown, "net") }
 func BenchmarkNetrunGen0(b *testing.B)     { benchGen(b, gen0, "net") }
 func BenchmarkXentOnly(b *testing.B)       { benchGen(b, gen0, "xent") }
+func BenchmarkNone(b *testing.B)           { benchGen(b, gen0, "none") }
