@@ -1,0 +1,113 @@
+#version 450
+// bits[r] = -log2 softmax(s_g * E·o_r)[target_r], for 64 rows per workgroup.
+// The logits are never stored: each thread keeps, for its 4 rows, a running
+// max and sum of exponentials over the columns it owns (flash-attention
+// style), and the 16 threads that share a row merge theirs at the end.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
+layout(std430, binding = 1) readonly buffer Tokens { uint tokens[]; };
+layout(std430, binding = 2) readonly buffer Emb { uint emb[]; };   // halves, Vocab x Dim
+layout(std430, binding = 3) readonly buffer Rows { uint rows[]; }; // halves, R x Dim
+layout(std430, binding = 4) writeonly buffer Bits { float bits[]; };
+
+layout(push_constant) uniform Push {
+	uint rows;
+	uint vocab;
+	uint dim;
+	uint scored;
+	uint windows;
+	uint warm;
+	uint startsOff;
+	uint scaleOff;
+} pc;
+
+#define TR 64u
+#define TC 64u
+#define DK 32u
+
+shared float As[TR][DK + 1u];
+shared float Bs[TC][DK + 1u];
+shared float redM[TR][16];
+shared float redS[TR][16];
+shared float redT[TR][16];
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	uint ty = tid / 16u, tx = tid % 16u;
+	uint r0 = gl_WorkGroupID.x * TR;
+	uint hd = pc.dim / 2u;
+
+	float scale[4];
+	uint target[4];
+	float m[4], s[4], tg[4];
+	for (uint i = 0u; i < 4u; i++) {
+		uint r = min(r0 + ty * 4u + i, pc.rows - 1u);
+		uint p = r / pc.scored;
+		uint g = p / pc.windows, w = p % pc.windows;
+		uint t = pc.warm + r % pc.scored;
+		scale[i] = uintBitsToFloat(gw[pc.scaleOff + g]);
+		target[i] = tokens[gw[pc.startsOff + w] + t + 1u];
+		m[i] = -1e30;
+		s[i] = 0.0;
+		tg[i] = -1e30;
+	}
+
+	for (uint c0 = 0u; c0 < pc.vocab; c0 += TC) {
+		float acc[4][4];
+		for (uint i = 0u; i < 4u; i++) for (uint j = 0u; j < 4u; j++) acc[i][j] = 0.0;
+		for (uint k0 = 0u; k0 < pc.dim; k0 += DK) {
+			// 64 x 32 halves per tile = 1024 words, 4 per thread, for each of A and B.
+			for (uint q = tid; q < TR * DK / 2u; q += 256u) {
+				uint rr = q / (DK / 2u), kk = q % (DK / 2u);
+				uint ra = min(r0 + rr, pc.rows - 1u);
+				vec2 a = unpackHalf2x16(rows[ra * hd + k0 / 2u + kk]);
+				As[rr][2u * kk] = a.x;
+				As[rr][2u * kk + 1u] = a.y;
+				uint cb = min(c0 + rr, pc.vocab - 1u);
+				vec2 e = unpackHalf2x16(emb[cb * hd + k0 / 2u + kk]);
+				Bs[rr][2u * kk] = e.x;
+				Bs[rr][2u * kk + 1u] = e.y;
+			}
+			barrier();
+			for (uint k = 0u; k < DK; k++) {
+				float a[4], bb[4];
+				for (uint i = 0u; i < 4u; i++) a[i] = As[ty * 4u + i][k];
+				for (uint j = 0u; j < 4u; j++) bb[j] = Bs[tx + 16u * j][k];
+				for (uint i = 0u; i < 4u; i++) for (uint j = 0u; j < 4u; j++) acc[i][j] += a[i] * bb[j];
+			}
+			barrier();
+		}
+		for (uint i = 0u; i < 4u; i++) {
+			float x[4];
+			float tm = m[i];
+			for (uint j = 0u; j < 4u; j++) {
+				uint c = c0 + tx + 16u * j;
+				x[j] = c < pc.vocab ? acc[i][j] * scale[i] : -1e30;
+				if (c == target[i]) tg[i] = x[j];
+				tm = max(tm, x[j]);
+			}
+			s[i] *= exp(m[i] - tm);
+			for (uint j = 0u; j < 4u; j++) s[i] += exp(x[j] - tm);
+			m[i] = tm;
+		}
+	}
+
+	for (uint i = 0u; i < 4u; i++) {
+		redM[ty * 4u + i][tx] = m[i];
+		redS[ty * 4u + i][tx] = s[i];
+		redT[ty * 4u + i][tx] = tg[i];
+	}
+	barrier();
+	if (tid < TR && r0 + tid < pc.rows) {
+		float M = -1e30, T = -1e30;
+		for (uint q = 0u; q < 16u; q++) {
+			M = max(M, redM[tid][q]);
+			T = max(T, redT[tid][q]);
+		}
+		float S = 0.0;
+		for (uint q = 0u; q < 16u; q++) S += redS[tid][q] * exp(redM[tid][q] - M);
+		bits[r0 + tid] = (M + log(S) - T) / 0.69314718055994530942;
+	}
+}

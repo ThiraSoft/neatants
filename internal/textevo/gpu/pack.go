@@ -109,3 +109,39 @@ func halfToFloat(h uint16) float32 {
 	}
 	return sign * (1 + m/1024) * float32(math.Ldexp(1, e-15))
 }
+
+// floatToHalf encodes x as an IEEE binary16 value, rounding to nearest even.
+// Callers keep |x| well under the half range, so larger values are clamped.
+func floatToHalf(x float32) uint16 {
+	b := math.Float32bits(x)
+	sign := uint16(b>>16) & 0x8000
+	e := int(b>>23&0xFF) - 127 + 15
+	m := b & 0x7FFFFF
+	switch {
+	case e >= 31:
+		return sign | 0x7BFF
+	case e <= 0:
+		if e < -10 {
+			return sign
+		}
+		// Subnormal half: shift the implicit one in, then round to even.
+		m |= 0x800000
+		shift := uint(14 - e)
+		h := m >> shift
+		rem := m & (1<<shift - 1)
+		half := uint32(1) << (shift - 1)
+		if rem > half || (rem == half && h&1 == 1) {
+			h++
+		}
+		return sign | uint16(h)
+	}
+	h := uint32(e)<<10 | m>>13
+	rem := m & 0x1FFF
+	if rem > 0x1000 || (rem == 0x1000 && h&1 == 1) {
+		h++ // a carry into the exponent is the correct rounding up
+	}
+	if h >= 0x7C00 {
+		h = 0x7BFF
+	}
+	return sign | uint16(h)
+}
