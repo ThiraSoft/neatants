@@ -199,7 +199,7 @@ func TestLayoutMatchesShader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]int{"MAX_NODES": MaxNodes, "MAX_EDGES": MaxEdges, "MAX_PLASTIC": MaxPlastic}
+	want := map[string]int{"MAX_NODES": MaxNodes, "MAX_EDGES": MaxEdges, "MAX_PLASTIC": MaxPlastic, "MAX_VALUES": MaxValues}
 	for name, v := range want {
 		m := regexp.MustCompile("-D" + name + `=(\d+)u`).FindSubmatch(src)
 		if m == nil {
@@ -280,6 +280,39 @@ func TestConcurrentSetMixed(t *testing.T) {
 		}
 		if round > 0 && up != 0 {
 			t.Fatalf("round %d uploaded %d networks again", round, up)
+		}
+	}
+}
+
+// TestBackCopiesAreDense checks that the previous-tick values the kernel keeps
+// are numbered 1..count without gaps, that a packed network only addresses
+// values below nodes+count, and that its kind words still hold the kind.
+func TestBackCopiesAreDense(t *testing.T) {
+	f := grown(3, 2000).BuildNetwork().Flat()
+	at, count := backCopies(f)
+	n := f.Nodes()
+	seen := make([]bool, count+1)
+	for _, a := range at {
+		if a != 0 {
+			if int(a) > count || seen[a] {
+				t.Fatalf("copy %d of %d is out of range or numbered twice", a, count)
+			}
+			seen[a] = true
+		}
+	}
+	if count == 0 {
+		t.Fatal("a grown network with no back edge: the test checks nothing")
+	}
+	dst := make([]uint32, SlotWords)
+	pack(dst, f)
+	for i := range f.From {
+		if from := dst[edgeOff+2*i]; int(from) >= n+count {
+			t.Fatalf("edge %d reads value %d, past the %d+%d the kernel keeps", i, from, n, count)
+		}
+	}
+	for i, k := range f.Kind {
+		if dst[kindOff+i]&0xFF != uint32(k) {
+			t.Fatalf("node %d: kind word %#x lost kind %d", i, dst[kindOff+i], k)
 		}
 	}
 }

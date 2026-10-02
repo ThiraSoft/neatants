@@ -1,6 +1,6 @@
 package gpubrain
 
-//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DMAX_NODES=1024u -DMAX_EDGES=4096u -DMAX_PLASTIC=256u activate.comp -o activate.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DMAX_NODES=1024u -DMAX_EDGES=4096u -DMAX_PLASTIC=256u -DMAX_VALUES=1024u activate.comp -o activate.spv
 
 import (
 	_ "embed"
@@ -38,6 +38,7 @@ type Batch struct {
 	prev                *vk.Buffer // arena before this round's growth, copied into arena by Start
 	prevSize            int
 	req, in             *vk.Buffer // Host: slot per request, inputs
+	slots               []uint32   // the slots of the round, kept here: reading the host buffer back is slow
 	out                 *vk.Buffer // Readback
 	staging             *vk.Buffer // Host: packed newborns of this round
 	inStride, outStride int
@@ -116,6 +117,7 @@ func (b *Batch) allocRequests(n int) error {
 		return err
 	}
 	b.reqCap = n
+	b.slots = make([]uint32, n)
 	return b.rebuildSet()
 }
 
@@ -189,7 +191,7 @@ func (b *Batch) Set(i int, net *neat.Network, in []float64) {
 			}
 		}
 	}
-	b.req.Uints()[i] = slot
+	b.slots[i] = slot
 }
 
 // admit gives a newborn a slot, or returns noSlot when the network is too
@@ -260,7 +262,7 @@ func (b *Batch) growStaging() {
 // reusable from the next round, so it can never be handed to a birth that is
 // already staged.
 func (b *Batch) Start() error {
-	for _, slot := range b.req.Uints()[:b.n] {
+	for _, slot := range b.slots[:b.n] {
 		if slot != noSlot {
 			b.lastSeen[slot] = b.round
 		}
@@ -275,6 +277,7 @@ func (b *Batch) Start() error {
 		}
 	}
 	b.mu.Unlock()
+	copy(b.req.Uints(), b.slots[:b.n])
 	push := [3]uint32{uint32(b.n), uint32(b.inStride), uint32(b.outStride)}
 	return b.d.Start(func(r *vk.Recorder) {
 		if b.prev != nil {
