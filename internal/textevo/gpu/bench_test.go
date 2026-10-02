@@ -24,13 +24,18 @@ func benchData(b *testing.B) *prep.Data {
 // benchGen runs generations of the population make builds and logs the split.
 // mode picks the kernels: "" both, "net" netrun alone, "xent" xent alone.
 func benchGen(b *testing.B, make func(i int, dim int) *neat.Genome, mode string) {
+	benchPop(b, 1000, make, mode)
+}
+
+// benchPop is benchGen for a population of n genomes.
+func benchPop(b *testing.B, n int, make func(i int, dim int) *neat.Genome, mode string) {
 	d0, err := vk.Open()
 	if err != nil {
 		b.Skip(err)
 	}
 	defer d0.Close()
 	d := benchData(b)
-	gs := make_pop(d.Dim, make)
+	gs := make_pop(n, d.Dim, make)
 	e, err := New(d0, d)
 	if err != nil {
 		b.Fatal(err)
@@ -49,12 +54,12 @@ func benchGen(b *testing.B, make func(i int, dim int) *neat.Genome, mode string)
 		gpu += e.Timing.GPU
 		sum += e.Timing.Sum
 	}
-	n := time.Duration(b.N)
-	b.Logf("per generation: pack %v, gpu %v, sum %v", pack/n, gpu/n, sum/n)
+	g := time.Duration(b.N)
+	b.Logf("per generation: pack %v, gpu %v, sum %v", pack/g, gpu/g, sum/g)
 }
 
-func make_pop(dim int, mk func(i, dim int) *neat.Genome) []*neat.Genome {
-	gs := make([]*neat.Genome, 1000)
+func make_pop(n, dim int, mk func(i, dim int) *neat.Genome) []*neat.Genome {
+	gs := make([]*neat.Genome, n)
 	for i := range gs {
 		gs[i] = mk(i, dim)
 	}
@@ -73,3 +78,9 @@ func BenchmarkNone(b *testing.B)           { benchGen(b, gen0, "none") }
 
 func grownBig(i, dim int) *neat.Genome { return model.Grown(int64(i), dim, 150) }
 func BenchmarkNetrunBig(b *testing.B)  { benchGen(b, grownBig, "net") }
+
+// The saturation curve of the card: ms per generation against population.
+func BenchmarkPop200(b *testing.B)  { benchPop(b, 200, grown, "") }
+func BenchmarkPop500(b *testing.B)  { benchPop(b, 500, grown, "") }
+func BenchmarkPop1000(b *testing.B) { benchPop(b, 1000, grown, "") }
+func BenchmarkPop2000(b *testing.B) { benchPop(b, 2000, grown, "") }
