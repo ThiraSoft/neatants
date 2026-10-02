@@ -28,6 +28,8 @@ type Evaluator struct {
 	// shared, in float for netrun and in halves for xent.
 	tokens       [2]*vk.Buffer
 	emb32, emb16 *vk.Buffer
+	// prior is the unigram log-prior every logit starts from.
+	prior *vk.Buffer
 
 	// Growable per-generation buffers, and the sets that bind them, one pair
 	// of sets for each token buffer.
@@ -83,6 +85,9 @@ func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
 	if e.emb16, err = upload(d, words(packHalves(data.E)), vk.UsageStorage); err != nil {
 		return nil, err
 	}
+	if e.prior, err = upload(d, floats(data.Prior()), vk.UsageStorage); err != nil {
+		return nil, err
+	}
 	if e.netPipe, err = d.NewPipeline(netrunSPV, 4, 7*4); err != nil {
 		return nil, err
 	}
@@ -130,12 +135,12 @@ func (e *Evaluator) Close() {
 		}
 	}
 	e.netPipe, e.xentPipe = nil, nil
-	for _, b := range []*vk.Buffer{e.tokens[0], e.tokens[1], e.emb32, e.emb16, e.up, e.gen, e.rows, e.bits} {
+	for _, b := range []*vk.Buffer{e.tokens[0], e.tokens[1], e.emb32, e.emb16, e.prior, e.up, e.gen, e.rows, e.bits} {
 		if b != nil {
 			b.Close()
 		}
 	}
-	e.tokens, e.emb32, e.emb16 = [2]*vk.Buffer{}, nil, nil
+	e.tokens, e.emb32, e.emb16, e.prior = [2]*vk.Buffer{}, nil, nil, nil
 	e.up, e.gen, e.rows, e.bits = nil, nil, nil, nil
 }
 
@@ -192,7 +197,7 @@ func (e *Evaluator) grow(upBytes, genBytes, rowBytes, bitBytes int) error {
 		if e.netSet[i], err = e.netPipe.NewSet([]*vk.Buffer{e.gen, e.tokens[i], e.emb32, e.rows}); err != nil {
 			return err
 		}
-		if e.xentSet[i], err = e.xentPipe.NewSet([]*vk.Buffer{e.gen, e.tokens[i], e.emb16, e.rows, e.bits}); err != nil {
+		if e.xentSet[i], err = e.xentPipe.NewSet([]*vk.Buffer{e.gen, e.tokens[i], e.emb16, e.rows, e.bits, e.prior}); err != nil {
 			return err
 		}
 	}

@@ -164,3 +164,17 @@ func TestQwenShakespeare(t *testing.T) {
 		t.Fatalf("vocab %d", d.Vocab())
 	}
 }
+
+func TestPriorIsAddOneUnigram(t *testing.T) {
+	d := &Data{QwenID: make([]int32, 5), Train: []int32{0, 0, 0, 2, 4, 4}}
+	got := d.Prior()
+	for j, c := range []int{3, 0, 1, 0, 2} {
+		want := math.Log(float64(c+1) / float64(6+5))
+		if math.Abs(float64(got[j])-want) > 1e-6 {
+			t.Fatalf("token %d: prior %g, want %g", j, got[j], want)
+		}
+	}
+	if &d.Prior()[0] != &got[0] {
+		t.Fatal("the prior is computed again on every call")
+	}
+}

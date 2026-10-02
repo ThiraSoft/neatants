@@ -84,6 +84,8 @@ func checkXent(t *testing.T, D int, wave uint32) {
 		return b
 	}
 	genB, tokB, embB, rowsB := up(gen.words), up(toks), up(packHalves(d.E)), up(packHalves(rows))
+	prior := d.Prior()
+	priorB := up(unsafe.Slice((*uint32)(unsafe.Pointer(&prior[0])), len(prior)))
 	size := 4 * (R + 64)
 	bitsB, err := dev.Local(size, vk.UsageStorage|vk.UsageTransferSrc|vk.UsageTransferDst)
 	if err != nil {
@@ -104,7 +106,7 @@ func checkXent(t *testing.T, D int, wave uint32) {
 		t.Fatal(err)
 	}
 	defer pipe.Close()
-	set, err := pipe.NewSet([]*vk.Buffer{genB, tokB, embB, rowsB, bitsB})
+	set, err := pipe.NewSet([]*vk.Buffer{genB, tokB, embB, rowsB, bitsB, priorB})
 	if err != nil {
 		t.Fatal(err)
 	}

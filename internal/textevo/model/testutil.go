@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"math/rand"
 
 	"github.com/ThiraSoft/neatants/internal/textevo/prep"
@@ -55,4 +56,41 @@ func Grown(seed int64, dim, mutations int) *neat.Genome {
 		}
 	}
 	return g
+}
+
+// ZeroGenome returns a genome whose outputs are exactly 0.5 whatever it reads,
+// so that o = 2v-1 is exactly zero and only the prior is left in the logits.
+func ZeroGenome(id, dim int) *neat.Genome {
+	g := NewGenome(id, dim)
+	for i := range g.Conns {
+		g.Conns[i].Weight = 0
+	}
+	return g
+}
+
+// Skew redraws the train and validation ids of d from a Zipf law, so that the
+// unigram prior of a test is far from uniform.
+func Skew(d *prep.Data, seed int64) {
+	rng := rand.New(rand.NewSource(seed))
+	z := rand.NewZipf(rng, 1.2, 1, uint64(d.Vocab()-1))
+	for _, ids := range [][]int32{d.Train, d.Val} {
+		for i := range ids {
+			ids[i] = int32(z.Uint64())
+		}
+	}
+}
+
+// UnigramBits is -log2 of the softmax of the prior at target, in float64: what
+// a network with o = 0 must score.
+func UnigramBits(d *prep.Data, target int32) float64 {
+	p := d.Prior()
+	m := math.Inf(-1)
+	for _, x := range p {
+		m = math.Max(m, float64(x))
+	}
+	s := 0.0
+	for _, x := range p {
+		s += math.Exp(float64(x) - m)
+	}
+	return (m + math.Log(s) - float64(p[target])) / math.Ln2
 }

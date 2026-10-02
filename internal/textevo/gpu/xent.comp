@@ -1,5 +1,6 @@
 #version 450
-// bits[r] = -log2 softmax(s_g * E·o_r)[target_r], for 64 rows per workgroup.
+// bits[r] = -log2 softmax(prior + s_g * E·o_r)[target_r], for 64 rows per
+// workgroup, prior being the unigram of the train tokens (prep.Data.Prior).
 // The logits are never stored: each thread keeps, for its 4 rows, a running
 // max and sum of exponentials over the columns it owns (flash-attention
 // style), and the 16 threads that share a row merge theirs at the end.
@@ -11,6 +12,7 @@ layout(std430, binding = 1) readonly buffer Tokens { uint tokens[]; };
 layout(std430, binding = 2) readonly buffer Emb { uint emb[]; };   // halves, Vocab x Dim
 layout(std430, binding = 3) readonly buffer Rows { uint rows[]; }; // halves, R x Dim
 layout(std430, binding = 4) writeonly buffer Bits { float bits[]; };
+layout(std430, binding = 5) readonly buffer Prior { float prior[]; };
 
 layout(push_constant) uniform Push {
 	uint rows;
@@ -84,7 +86,7 @@ void main() {
 			float tm = m[i];
 			for (uint j = 0u; j < 4u; j++) {
 				uint c = c0 + tx + 16u * j;
-				x[j] = c < pc.vocab ? acc[i][j] * scale[i] : -1e30;
+				x[j] = c < pc.vocab ? prior[c] + acc[i][j] * scale[i] : -1e30;
 				if (c == target[i]) tg[i] = x[j];
 				tm = max(tm, x[j]);
 			}

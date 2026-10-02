@@ -4,7 +4,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : enable
-// Same contract as xent.comp: bits[r] = -log2 softmax(s_g * E·o_r)[target_r],
+// Same contract as xent.comp: bits[r] = -log2 softmax(prior + s_g * E·o_r)[target_r],
 // but the block of logits of each column step comes out of the matrix cores.
 // A workgroup is four waves; each wave owns RB blocks of 16 rows, keeps their
 // operand in registers for the whole vocabulary, and multiplies it by four
@@ -35,6 +35,7 @@ layout(std430, binding = 1) readonly buffer Tokens { uint tokens[]; };
 layout(std430, binding = 2) readonly buffer Emb { uvec4 emb[]; };   // halves, Vocab x Dim
 layout(std430, binding = 3) readonly buffer Rows { uvec4 rows[]; }; // halves, R x Dim
 layout(std430, binding = 4) writeonly buffer Bits { float bits[]; };
+layout(std430, binding = 5) readonly buffer Prior { float prior[]; };
 
 layout(push_constant) uniform Push {
 	uint rows;
@@ -48,6 +49,10 @@ layout(push_constant) uniform Push {
 } pc;
 
 shared uvec4 Bs[TC * RW];
+// The prior of the staged columns in base 2, seen as vec4 the way a lane
+// reads its logits. A column past the vocabulary gets -1e30, which masks it
+// whatever its product.
+shared vec4 Ps[TC / 4u];
 // The operand is read into registers once, before the first logits are stored,
 // so its staging area and the logits share their memory.
 shared vec4 Ss[TR * RW];
@@ -109,7 +114,7 @@ void main() {
 				d += dot(unpackHalf2x16(x.x), unpackHalf2x16(e.x)) + dot(unpackHalf2x16(x.y), unpackHalf2x16(e.y))
 					+ dot(unpackHalf2x16(x.z), unpackHalf2x16(e.z)) + dot(unpackHalf2x16(x.w), unpackHalf2x16(e.w));
 			}
-			tg[ib] = d * scale[ib];
+			tg[ib] = d * scale[ib] + prior[target] * LOG2E;
 		}
 	}
 
@@ -119,6 +124,7 @@ void main() {
 			uint row = q / wv, kk = q % wv;
 			Bs[row * RW + kk] = emb[min(c0 + row, pc.vocab - 1u) * wv + kk];
 		}
+		if (tid < TC) Ps[tid >> 2][tid & 3u] = c0 + tid < pc.vocab ? prior[c0 + tid] * LOG2E : -1e30;
 		barrier();
 		[[unroll]] for (uint j = 0u; j < 4u; j++) {
 			coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[RB];
@@ -138,23 +144,16 @@ void main() {
 		subgroupBarrier();
 		[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
 			uint r = (wave * RB + ib) * 16u + (lane >> 2);
-			// The raw products: the scale is positive, so the maximum
-			// commutes with it and is taken before it.
+			// The logits in base 2: the prior of each column plus its scaled
+			// product. Masked columns stay near -1e30 since no product comes
+			// close to that.
 			vec4 x[4];
-			[[unroll]] for (uint c = 0u; c < 4u; c++) x[c] = Ss[r * SW + c * 4u + part];
-			if (c0 + TC > pc.vocab) {
-				// The last block is ragged: a column past the vocabulary
-				// gets a product so low that it contributes nothing.
-				[[unroll]] for (uint c = 0u; c < 4u; c++)
-					[[unroll]] for (uint e = 0u; e < 4u; e++)
-						if (c0 + (c * 4u + part) * 4u + e >= pc.vocab) x[c][e] = -1e30;
-			}
+			[[unroll]] for (uint c = 0u; c < 4u; c++) x[c] = Ss[r * SW + c * 4u + part] * scale[ib] + Ps[c * 4u + part];
 			vec4 mx = max(max(x[0], x[1]), max(x[2], x[3]));
-			float tm = max(m[ib], max(max(mx.x, mx.y), max(mx.z, mx.w)) * scale[ib]);
+			float tm = max(m[ib], max(max(mx.x, mx.y), max(mx.z, mx.w)));
 			s[ib] *= exp2(m[ib] - tm);
 			[[unroll]] for (uint c = 0u; c < 4u; c++) {
-				vec4 y = vec4(exp2(x[c].x * scale[ib] - tm), exp2(x[c].y * scale[ib] - tm),
-					exp2(x[c].z * scale[ib] - tm), exp2(x[c].w * scale[ib] - tm));
+				vec4 y = exp2(x[c] - tm);
 				s[ib] += (y.x + y.y) + (y.z + y.w);
 			}
 			m[ib] = tm;

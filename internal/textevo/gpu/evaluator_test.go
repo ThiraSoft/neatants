@@ -190,3 +190,37 @@ func TestEvaluatorCacheIgnoresChangedCopy(t *testing.T) {
 		t.Fatalf("changed copy: gpu %g cpu %g (stale record reused)", got[0], want[0])
 	}
 }
+
+// A network with o = 0 is the unigram on the card too, through both xent
+// kernels: D 32 always runs the scalar one, D 128 the matrix one when the
+// device has it.
+func TestEvaluatorZeroIsUnigram(t *testing.T) {
+	for _, dim := range []int{32, 128} {
+		dev := device(t)
+		d := model.Synthetic(300, dim, 3000, 19)
+		model.Skew(d, 19)
+		e, err := New(dev, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		starts := []int{3, 900, 2000, 2500}
+		got, _, err := e.Evaluate([]*neat.Genome{model.ZeroGenome(1, dim), model.ZeroGenome(2, dim)}, starts, 80, 16)
+		e.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		bits := 0.0
+		for _, s := range starts {
+			for tk := 16; tk < 80; tk++ {
+				bits += model.UnigramBits(d, d.Train[s+tk+1])
+			}
+		}
+		want := bits / float64(model.WindowBytes(d, d.Train, starts, 80, 16))
+		t.Logf("D %d (coop %v): gpu %.6f, unigram %.6f", dim, e.coop, got[0], want)
+		for i := range got {
+			if math.Abs(got[i]-want) > 1e-3 {
+				t.Fatalf("D %d genome %d: gpu %g bpb, unigram %g", dim, i, got[i], want)
+			}
+		}
+	}
+}

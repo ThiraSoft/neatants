@@ -30,15 +30,17 @@ func encodePrompt(enc prep.Encoder, d *prep.Data, text string) ([]int32, error) 
 }
 
 // logits returns the scores of every active token for the output vector o,
-// computed as the evaluation does: scale times the dot with the embedding.
+// computed as the evaluation does: the unigram prior plus scale times the
+// dot with the embedding.
 func logits(d *prep.Data, o []float32, scale float32) []float64 {
+	prior := d.Prior()
 	out := make([]float64, d.Vocab())
 	for j := range out {
 		var dot float32
 		for k, e := range d.Row(int32(j)) {
 			dot += e * o[k]
 		}
-		out[j] = float64(scale * dot)
+		out[j] = float64(prior[j]) + float64(scale*dot)
 	}
 	return out
 }

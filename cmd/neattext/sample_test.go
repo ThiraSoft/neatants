@@ -48,3 +48,15 @@ func TestSampleLength(t *testing.T) {
 		}
 	}
 }
+
+// The sampler scores tokens as the evaluation does: with o = 0 its logits are
+// the unigram prior.
+func TestLogitsStartFromThePrior(t *testing.T) {
+	d := model.Synthetic(10, 8, 50, 1)
+	got := logits(d, make([]float32, 8), 3)
+	for j, p := range d.Prior() {
+		if got[j] != float64(p) {
+			t.Fatalf("token %d: logit %g, prior %g", j, got[j], p)
+		}
+	}
+}

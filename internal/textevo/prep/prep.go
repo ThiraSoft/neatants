@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 
 	"github.com/ThiraSoft/golem/tensors"
 )
@@ -20,6 +21,9 @@ type Data struct {
 	E      []float32 // Vocab()*Dim, row-major, whitened
 	Train  []int32   // active ids
 	Val    []int32
+
+	prior     []float32
+	priorOnce sync.Once
 }
 
 // Encoder is the part of a tokenizer that prep needs.
@@ -30,6 +34,27 @@ type Encoder interface {
 
 // Vocab is the number of active tokens.
 func (d *Data) Vocab() int { return len(d.QwenID) }
+
+// Prior is the add-one unigram of Train in natural log, ln((c_j+1)/(N+V)),
+// the same model as the unigram baseline. Every logit starts from it, so that
+// a network whose output is zero predicts token frequencies instead of a
+// uniform draw, and what the network learns is only the correction to them.
+// It is computed on the first call and shared afterwards: the evaluators call
+// it from many goroutines.
+func (d *Data) Prior() []float32 {
+	d.priorOnce.Do(func() {
+		c := make([]int, d.Vocab())
+		for _, id := range d.Train {
+			c[id]++
+		}
+		n := float64(len(d.Train) + d.Vocab())
+		d.prior = make([]float32, d.Vocab())
+		for j, k := range c {
+			d.prior[j] = float32(math.Log(float64(k+1) / n))
+		}
+	})
+	return d.prior
+}
 
 // Row is the embedding of an active token, a view into E.
 func (d *Data) Row(id int32) []float32 {

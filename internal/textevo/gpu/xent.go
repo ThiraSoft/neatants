@@ -32,7 +32,7 @@ const xentCoopWave = 64
 // asked for rather than taken: RADV runs compute at sixty-four by default but
 // may offer thirty-two, and xent_coop.comp refuses any width but its own.
 func newXentPipe(d *vk.Device, coop bool, wave uint32) (*vk.Pipeline, error) {
-	p, err := d.NewPipeline(xentSPV, 5, 8*4)
+	p, err := d.NewPipeline(xentSPV, 6, 8*4)
 	if err != nil || !coop {
 		return p, err
 	}

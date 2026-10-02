@@ -33,16 +33,19 @@ func Rows(g *neat.Genome, d *prep.Data, ids []int32, start, length, warm int) []
 	return rows
 }
 
-// Bits is -log2 of the softmax probability of target, in float64.
+// Bits is -log2 of the softmax probability of target, in float64. The logit
+// of token j is its unigram prior plus the scaled dot product, so that the
+// network only has to learn what the token frequencies do not say.
 func Bits(d *prep.Data, o []float32, logitScale float32, target int32) float64 {
 	m := math.Inf(-1)
+	prior := d.Prior()
 	logits := make([]float64, d.Vocab())
 	for j := range logits {
 		var dot float32
 		for k, e := range d.Row(int32(j)) {
 			dot += e * o[k]
 		}
-		logits[j] = float64(logitScale * dot)
+		logits[j] = float64(prior[j]) + float64(logitScale*dot)
 		m = math.Max(m, logits[j])
 	}
 	s := 0.0
