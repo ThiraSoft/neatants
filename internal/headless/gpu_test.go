@@ -3,6 +3,7 @@ package headless
 import (
 	"math/rand"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -18,10 +19,11 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestGroupTicksLikeCPU steps worlds through the GPU group for a few hundred
-// ticks: they must keep living (ants born and dying, monsters thinking)
-// without errors, and the batch must have uploaded and freed networks.
-func TestGroupTicksLikeCPU(t *testing.T) {
+// TestSchedulerTicksLikeCPU runs worlds through one GPU group for a few
+// hundred ticks: they must keep living (ants born and dying, monsters
+// thinking) without errors, and the batch must have uploaded and freed
+// networks.
+func TestSchedulerTicksLikeCPU(t *testing.T) {
 	d, err := vk.Open()
 	if err != nil {
 		t.Skipf("no Vulkan device: %v", err)
@@ -31,22 +33,16 @@ func TestGroupTicksLikeCPU(t *testing.T) {
 	sim.SavePath = t.TempDir() + "/colonies.json"
 	rand.Seed(1)
 	worlds := []*sim.World{sim.NewWorld(), sim.NewWorld(), sim.NewWorld()}
-	g, err := newGroup(d, worlds)
+	var stopped atomic.Bool
+	s, err := newScheduler(d, worlds, 1, &stopped)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer g.close()
-	for range 600 {
-		g.sense()
-		if err := g.start(); err != nil {
-			t.Fatal(err)
-		}
-		if err := g.finish(); err != nil {
-			t.Fatal(err)
-		}
-		g.act()
+	defer s.close()
+	if _, err := s.run(600); err != nil {
+		t.Fatal(err)
 	}
-	up, freed, _ := g.batch.Stats()
+	up, freed, _ := s.groups[0].batch.Stats()
 	if up == 0 || freed == 0 {
 		t.Fatalf("uploaded %d, freed %d networks in 600 ticks", up, freed)
 	}
@@ -57,10 +53,10 @@ func TestGroupTicksLikeCPU(t *testing.T) {
 	}
 }
 
-// TestPipelineKeepsWorldsInStep runs the A/B pipeline and checks that every
-// world advanced by exactly the number of steps, and that drain, called with
-// a dispatch in flight, finishes it without deadlock.
-func TestPipelineKeepsWorldsInStep(t *testing.T) {
+// TestSchedulerKeepsWorldsInStep splits 7 worlds into 3 uneven groups and runs
+// several short epochs. At every quiet point each world must be at the tick
+// the epochs add up to, whatever order the groups were scheduled in.
+func TestSchedulerKeepsWorldsInStep(t *testing.T) {
 	d, err := vk.Open()
 	if err != nil {
 		t.Skipf("no Vulkan device: %v", err)
@@ -68,36 +64,84 @@ func TestPipelineKeepsWorldsInStep(t *testing.T) {
 	defer d.Close()
 	sim.LoadConfig("config.yml")
 	sim.SavePath = t.TempDir() + "/colonies.json"
-	rand.Seed(2)
+	worlds := make([]*sim.World, 7)
+	for i := range worlds {
+		worlds[i] = sim.NewWorld()
+	}
+	var stopped atomic.Bool
+	s, err := newScheduler(d, worlds, 3, &stopped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	if len(s.groups) != 3 || len(s.groups[0].worlds) != 2 || len(s.groups[1].worlds) != 2 || len(s.groups[2].worlds) != 3 {
+		t.Fatalf("unexpected split: %d groups", len(s.groups))
+	}
+	tick := 0
+	for _, steps := range []int{100, 1, 150, 49} {
+		ran, err := s.run(steps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tick += steps
+		for k, r := range ran {
+			if r != steps {
+				t.Fatalf("group %d ran %d ticks, want %d", k, r, steps)
+			}
+		}
+		for i, w := range worlds {
+			if w.Tick != tick {
+				t.Fatalf("world %d at tick %d, want %d", i, w.Tick, tick)
+			}
+		}
+	}
+	gpuIdle, cpuIdle := s.takeStats()
+	t.Logf("GPU idle %.0f%%, workers idle %.0f%%", 100*gpuIdle, 100*cpuIdle)
+}
+
+// TestSchedulerStops sets the stop flag during a run: every group must drain
+// at its next round, the worlds of a group staying in the same tick, and run
+// must return the ticks done.
+func TestSchedulerStops(t *testing.T) {
+	d, err := vk.Open()
+	if err != nil {
+		t.Skipf("no Vulkan device: %v", err)
+	}
+	defer d.Close()
+	sim.LoadConfig("config.yml")
+	sim.SavePath = t.TempDir() + "/colonies.json"
 	worlds := make([]*sim.World, 5)
 	for i := range worlds {
 		worlds[i] = sim.NewWorld()
 	}
-	p, err := newPipeline(d, worlds)
+	var stopped atomic.Bool
+	s, err := newScheduler(d, worlds, 3, &stopped)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.close()
-	if err := p.prime(); err != nil {
+	defer s.close()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		stopped.Store(true)
+	}()
+	var ran []int
+	waitReturn(t, func() { ran, err = s.run(1 << 30) })
+	if err != nil {
 		t.Fatal(err)
 	}
-	for range 300 {
-		if err := p.step(); err != nil {
-			t.Fatal(err)
+	for k, g := range s.groups {
+		if ran[k] == 0 {
+			t.Fatalf("group %d ran no tick", k)
 		}
-	}
-	if err := p.drain(); err != nil {
-		t.Fatal(err)
-	}
-	// prime runs the first Sense and drain the last Act: 301 ticks.
-	for i, w := range worlds {
-		if w.Tick != 301 {
-			t.Fatalf("world %d at tick %d after prime, 300 steps and drain", i, w.Tick)
+		for _, w := range g.worlds {
+			if w.Tick != ran[k] {
+				t.Fatalf("group %d: a world at tick %d, group ran %d", k, w.Tick, ran[k])
+			}
 		}
 	}
 }
 
-// TestRunWorldsHonoursTicks checks that the pipeline's prime and drain do not
+// TestRunWorldsHonoursTicks checks that the scheduler's prime and drain do not
 // add ticks: 7 ticks in epochs of 3 must leave every world at tick 7.
 func TestRunWorldsHonoursTicks(t *testing.T) {
 	d, err := vk.Open()
@@ -112,7 +156,7 @@ func TestRunWorldsHonoursTicks(t *testing.T) {
 	for i := range worlds {
 		worlds[i] = sim.NewWorld()
 	}
-	runWorlds(worlds, 7, 3, time.Hour, true)
+	runWorlds(worlds, 7, 3, time.Hour, true, 3)
 	for i, w := range worlds {
 		if w.Tick != 7 {
 			t.Fatalf("world %d at tick %d, want 7", i, w.Tick)
@@ -132,14 +176,14 @@ func TestRunWorldsStopsAndSaves(t *testing.T) {
 	d.Close()
 	sim.LoadConfig("config.yml")
 	sim.SavePath = t.TempDir() + "/colonies.json"
-	waitReturn(t, func() { RunWorlds(4, 6000, 500, time.Hour, true) })
+	waitReturn(t, func() { RunWorlds(4, 6000, 500, time.Hour, true, 3) })
 	if _, err := os.Stat(sim.SavePath); err != nil {
 		t.Fatalf("no save after the run: %v", err)
 	}
 }
 
 // TestRunWorldsInterrupted sends SIGINT to an unbounded run, as Ctrl+C does:
-// the pipeline must drain, save and return, for several worlds and for one.
+// the scheduler must drain, save and return, for several worlds and for one.
 func TestRunWorldsInterrupted(t *testing.T) {
 	d, err := vk.Open()
 	if err != nil {
@@ -153,7 +197,7 @@ func TestRunWorldsInterrupted(t *testing.T) {
 			time.Sleep(12 * time.Second) // long enough for a hall of fame to fill
 			syscall.Kill(os.Getpid(), syscall.SIGINT)
 		}()
-		waitReturn(t, func() { RunWorlds(n, 0, 100000, time.Hour, true) })
+		waitReturn(t, func() { RunWorlds(n, 0, 100000, time.Hour, true, 3) })
 		if _, err := os.Stat(sim.SavePath); err != nil {
 			t.Fatalf("%d worlds: no save after Ctrl+C: %v", n, err)
 		}

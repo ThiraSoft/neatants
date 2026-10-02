@@ -28,18 +28,19 @@ func main() {
 	worlds := flag.Int("worlds", runtime.NumCPU(), "worlds evolving in parallel (1 = a single world, brains spread over the cores)")
 	epoch := flag.Int("migrate", 20000, "ticks between two champion migrations from one world to the next")
 	gpu := flag.Bool("gpu", false, "think on the GPU (Vulkan), batching every world's brains")
+	groups := flag.Int("groups", 3, "with -gpu, groups of worlds sharing a GPU batch (more groups keep the cores busier but make smaller dispatches)")
 	flag.Parse()
 	given := false
 	flag.Visit(func(f *flag.Flag) { given = given || f.Name == "worlds" })
 	if *gpu && !given {
-		*worlds = 48
+		*worlds = 96
 	}
 
 	// The simulation allocates little per tick: fewer, larger GC cycles.
 	debug.SetGCPercent(400)
 	sim.LoadConfig(*config)
 	if *worlds > 1 || *gpu {
-		headless.RunWorlds(*worlds, *ticks, max(500, *epoch), *every, *gpu)
+		headless.RunWorlds(*worlds, *ticks, max(500, *epoch), *every, *gpu, *groups)
 		return
 	}
 	w := sim.NewWorld()

@@ -24,36 +24,30 @@ import (
 // in crossover.
 
 // RunWorlds evolves n worlds in parallel until ticks per world are done (0 = until
-// interrupted), exchanging champions every epoch ticks.
-func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool) {
-	runWorlds(sim.NewWorlds(n), ticks, epoch, every, gpu)
+// interrupted), exchanging champions every epoch ticks. With gpu, the brains
+// think on the card, the worlds being split into groups (one batch each) so
+// the cores always have a world to step while the card thinks for another group.
+func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool, groups int) {
+	runWorlds(sim.NewWorlds(n), ticks, epoch, every, gpu, groups)
 }
 
 // runWorlds is RunWorlds on worlds already built, so tests can inspect them.
-func runWorlds(worlds []*sim.World, ticks, epoch int, every time.Duration, gpu bool) {
+func runWorlds(worlds []*sim.World, ticks, epoch int, every time.Duration, gpu bool, groups int) {
 	n := len(worlds)
 	for _, w := range worlds {
 		w.SerialBrains = true
 	}
-	var g *group
-	var p *pipeline
+	var stopped atomic.Bool
+	var sched *scheduler
 	if gpu {
 		d, err := vk.Open()
 		if err == nil {
-			if n > 1 {
-				p, err = newPipeline(d, worlds)
-			} else {
-				g, err = newGroup(d, worlds)
-			}
+			sched, err = newScheduler(d, worlds, groups, &stopped)
 			if err != nil {
 				d.Close()
 			} else {
 				defer d.Close()
-				if p != nil {
-					defer p.close()
-				} else {
-					defer g.close()
-				}
+				defer sched.close()
 			}
 		}
 		if err != nil {
@@ -65,7 +59,6 @@ func runWorlds(worlds []*sim.World, ticks, epoch int, every time.Duration, gpu b
 		fmt.Fprintf(os.Stderr, "[HEADLESS] GPU error, lineages saved: %v\n", err)
 		os.Exit(1)
 	}
-	var stopped atomic.Bool
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -76,7 +69,6 @@ func runWorlds(worlds []*sim.World, ticks, epoch int, every time.Duration, gpu b
 	fmt.Printf("[HEADLESS] %d worlds in parallel · migration every %d ticks · Ctrl+C to stop and save\n", n, epoch)
 	start, last, lastSave := time.Now(), time.Now(), time.Now()
 	done, lastDone := 0, 0
-	var looped time.Duration // time spent in the pipeline loop, migration and saves excluded
 	for !stopped.Load() && (ticks == 0 || done < ticks) {
 		steps := epoch
 		if ticks > 0 {
@@ -84,65 +76,37 @@ func runWorlds(worlds []*sim.World, ticks, epoch int, every time.Duration, gpu b
 		}
 		ran := make([]int, n)
 		var wg sync.WaitGroup
-		if p != nil {
-			// Every world ticks together, so they all ran the same count. The
-			// pipeline's prime and drain add one tick to the steps.
-			count := 0
-			loopStart := time.Now()
-			if err := p.prime(); err != nil {
+		if sched != nil {
+			// The scheduler leaves every world quiet, so migration and the
+			// saves below never touch a world being stepped.
+			perGroup, err := sched.run(steps)
+			if err != nil {
 				gpuFail(err)
 			}
-			for k := 0; k < steps-1 && !(k%500 == 0 && stopped.Load()); k++ {
-				if err := p.step(); err != nil {
-					gpuFail(err)
+			i := 0
+			for k, g := range sched.groups {
+				for range g.worlds {
+					ran[i] = perGroup[k]
+					i++
 				}
-				count++
 			}
-			if err := p.drain(); err != nil {
-				gpuFail(err)
-			}
-			count++
-			looped += time.Since(loopStart)
-			for i := range ran {
-				ran[i] = count
-			}
-		} else if g != nil {
-			// A single world has nothing to overlap with: plain lockstep.
-			count := 0
-			for k := 0; k < steps && !(k%500 == 0 && stopped.Load()); k++ {
-				g.sense()
-				err := g.start()
-				if err == nil {
-					err = g.finish()
-				}
-				if err != nil {
-					gpuFail(err)
-				}
-				g.act()
-				count++
-			}
-			for i := range ran {
-				ran[i] = count
-			}
-		}
-		for i, w := range worlds {
-			if g != nil || p != nil {
-				break
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for k := 0; k < steps; k++ {
-					w.Update()
-					w.Events = w.Events[:0]
-					ran[i]++
-					if k%500 == 0 && stopped.Load() {
-						return
+		} else {
+			for i, w := range worlds {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for k := 0; k < steps; k++ {
+						w.Update()
+						w.Events = w.Events[:0]
+						ran[i]++
+						if k%500 == 0 && stopped.Load() {
+							return
+						}
 					}
-				}
-			}()
+				}()
+			}
+			wg.Wait()
 		}
-		wg.Wait()
 		done += minInts(ran)
 		migrate(worlds)
 
@@ -156,20 +120,16 @@ func runWorlds(worlds []*sim.World, ticks, epoch int, every time.Duration, gpu b
 			tps := float64(batch) / window.Seconds()
 			last, lastDone = time.Now(), done
 			reportWorlds(worlds, tps, time.Since(start))
-			if g != nil {
-				up, freed, cpu := g.batch.Stats()
-				fmt.Printf("  GPU: %d networks uploaded, %d freed, %d run on the CPU\n", up, freed, cpu)
-			}
-			if p != nil {
+			if sched != nil {
 				var up, freed, cpu int
-				for _, h := range []*group{p.a, p.b} {
-					u, f, c := h.batch.Stats()
+				for _, g := range sched.groups {
+					u, f, c := g.batch.Stats()
 					up, freed, cpu = up+u, freed+f, cpu+c
 				}
 				fmt.Printf("  GPU: %d networks uploaded, %d freed, %d run on the CPU\n", up, freed, cpu)
-				fmt.Printf("  cpu waited %.0f%% of the stepping time for the GPU · CPU half-step %.2f ms\n",
-					100*p.cpuWait.Seconds()/max(looped.Seconds(), 1e-9), p.cpuStep.Seconds()*1000/float64(max(1, 2*batch)))
-				p.cpuWait, p.cpuStep, looped = 0, 0, 0
+				gpuIdle, cpuIdle := sched.takeStats()
+				fmt.Printf("  GPU idle %.0f%% of the time (waiting for a group) · workers idle %.0f%% (waiting for a world) · %d groups\n",
+					100*gpuIdle, 100*cpuIdle, len(sched.groups))
 			}
 		}
 	}

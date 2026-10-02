@@ -116,7 +116,7 @@ func BenchmarkDispatch(b *testing.B) {
 				err := d.Start(func(r *vk.Recorder) {
 					tl.Reset(r)
 					tl.Stamp(r, "start")
-					r.Dispatch(bt.set, uint32(n), unsafe.Pointer(&push))
+					r.Dispatch(bt.cur.set, uint32(n), unsafe.Pointer(&push))
 					tl.Stamp(r, "dispatch")
 				})
 				if err == nil {

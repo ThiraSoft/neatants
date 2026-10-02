@@ -90,11 +90,12 @@ func TestBatchMatchesCPU(t *testing.T) {
 		}
 		b.Open(len(asked))
 		ins := make([][]float32, len(asked))
+		tickets := make([]int, len(asked))
 		for i, e := range asked {
 			for k := range in {
 				in[k] = float64(float32(r.Float64()*2 - 1))
 			}
-			b.Add(e.gpu, in)
+			tickets[i] = b.Add(e.gpu, in)
 			ins[i] = make([]float32, 67)
 			for k, x := range in {
 				ins[i][k] = float32(x)
@@ -108,7 +109,7 @@ func TestBatchMatchesCPU(t *testing.T) {
 		}
 		for i, e := range asked {
 			want := e.cpu.Activate(ins[i])
-			got := b.Out(i)
+			got := b.Out(tickets[i])
 			for k := range want {
 				diff := math.Abs(float64(got[k] - want[k]))
 				worst = max(worst, diff)
@@ -150,14 +151,14 @@ func TestSlotReuseStartsFresh(t *testing.T) {
 	g := grown(6, 2000)
 	young, ref := g.BuildNetwork(), g.BuildNetwork()
 	b.Open(1)
-	b.Add(young, in)
+	ticket := b.Add(young, in)
 	run(t, b)
 	in32 := make([]float32, 67)
 	for k := range in32 {
 		in32[k] = 0.5
 	}
 	want := ref.Activate(in32)
-	for k, x := range b.Out(0) {
+	for k, x := range b.Out(ticket) {
 		if math.Abs(float64(x-want[k])) > 1e-5 {
 			t.Fatalf("output %d of a reused slot: %v, fresh CPU %v", k, x, want[k])
 		}
@@ -179,10 +180,10 @@ func TestOversizedRunsOnCPU(t *testing.T) {
 	big, ref := g.BuildNetwork(), g.BuildNetwork()
 	in := make([]float64, 67)
 	b.Open(1)
-	b.Add(big, in)
+	ticket := b.Add(big, in)
 	run(t, b)
 	want := ref.Activate(make([]float32, 67))
-	for k, x := range b.Out(0) {
+	for k, x := range b.Out(ticket) {
 		if x != want[k] {
 			t.Fatalf("oversized output %d: %v, want %v", k, x, want[k])
 		}
@@ -369,10 +370,11 @@ func TestOverflowRunsOnCPUThenGrows(t *testing.T) {
 		run(t, b)
 		seen := map[int]bool{}
 		for i := range n {
-			if seen[idx[i]] || idx[i] >= n {
-				t.Fatalf("round %d: request %d got index %d twice or out of range", round, i, idx[i])
+			if k := idx[i] & (1<<genShift - 1); seen[k] || k >= n {
+				t.Fatalf("round %d: request %d got index %d twice or out of range", round, i, k)
+			} else {
+				seen[k] = true
 			}
-			seen[idx[i]] = true
 			in32 := make([]float32, 67)
 			for k, x := range ins[i] {
 				in32[k] = float32(x)
@@ -395,5 +397,79 @@ func TestOverflowRunsOnCPUThenGrows(t *testing.T) {
 				t.Fatalf("round 1: %d still overflow after growing", onCPU)
 			}
 		}
+	}
+}
+
+// TestOutSurvivesNextRound reads the outputs of round r while round r+1 is
+// open and receiving Adds, as the scheduler's workers do. They must match
+// the CPU twin (checked once, right after round r) and stay exactly the same
+// during round r+1. The rounds overflow and grow their buffers, and one
+// network is too big for a slot.
+func TestOutSurvivesNextRound(t *testing.T) {
+	d := device(t)
+	b, err := New(d, 72, 8, 3, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	const n = 20
+	og := oversized(11)
+	r := rand.New(rand.NewSource(6))
+	var prevTickets []int
+	var snap [][]float32 // outputs of the previous round, copied right after it
+	for round := range 6 {
+		// Fresh networks each round: one that overflows runs on its CPU copy,
+		// which does not follow what the card has learned.
+		var gpu, cpu []*neat.Network
+		for i := range n {
+			g := grown(int64(500+round*n+i), 2000)
+			gpu, cpu = append(gpu, g.BuildNetwork()), append(cpu, g.BuildNetwork())
+		}
+		gpu, cpu = append(gpu, og.BuildNetwork()), append(cpu, og.BuildNetwork())
+		ins := make([][]float64, len(gpu))
+		for i := range ins {
+			ins[i] = make([]float64, 67)
+			for k := range ins[i] {
+				ins[i][k] = float64(float32(r.Float64()*2 - 1))
+			}
+		}
+		b.Open(4) // small: rounds overflow, and the buffers grow
+		tickets := make([]int, len(gpu))
+		var wg sync.WaitGroup
+		for w := range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := w; i < len(gpu); i += 4 {
+					tickets[i] = b.Add(gpu[i], ins[i])
+				}
+			}()
+		}
+		for i, tk := range prevTickets {
+			got := b.Out(tk)
+			for k, want := range snap[i] {
+				if got[k] != want {
+					t.Errorf("round %d: output %d of request %d changed once the next round opened: %v, was %v", round, k, i, got[k], want)
+				}
+			}
+		}
+		wg.Wait()
+		run(t, b)
+		snap = snap[:0]
+		for i := range gpu {
+			in32 := make([]float32, 67)
+			for k, x := range ins[i] {
+				in32[k] = float32(x)
+			}
+			want := cpu[i].Activate(in32)
+			got := b.Out(tickets[i])
+			for k := range want {
+				if diff := math.Abs(float64(got[k] - want[k])); diff > 1e-3 {
+					t.Fatalf("round %d request %d output %d: GPU %v, CPU %v", round, i, k, got[k], want[k])
+				}
+			}
+			snap = append(snap, append([]float32(nil), got[:8]...))
+		}
+		prevTickets = tickets
 	}
 }
