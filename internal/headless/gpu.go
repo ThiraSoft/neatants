@@ -127,13 +127,19 @@ func (p *pipeline) half(done, next *group) error {
 
 // drain finishes the dispatch in flight and the pending ticks, so the worlds
 // can be saved. They are then between ticks: prime resumes them.
-func (p *pipeline) drain() {
-	if p.a.finish() == nil {
-		p.a.act()
+func (p *pipeline) drain() error {
+	if err := p.a.finish(); err != nil {
+		return err
 	}
-	if p.b.start() == nil && p.b.finish() == nil {
-		p.b.act()
+	p.a.act()
+	if err := p.b.start(); err != nil {
+		return err
 	}
+	if err := p.b.finish(); err != nil {
+		return err
+	}
+	p.b.act()
+	return nil
 }
 
 func (p *pipeline) close() {

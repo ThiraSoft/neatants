@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/ThiraSoft/golem/vk"
 	"github.com/ThiraSoft/neatants/internal/sim"
@@ -56,8 +57,8 @@ func TestGroupTicksLikeCPU(t *testing.T) {
 }
 
 // TestPipelineKeepsWorldsInStep runs the A/B pipeline and checks that every
-// world advanced by exactly the number of steps, then stops mid-flight and
-// drains without deadlock.
+// world advanced by exactly the number of steps, and that drain, called with
+// a dispatch in flight, finishes it without deadlock.
 func TestPipelineKeepsWorldsInStep(t *testing.T) {
 	d, err := vk.Open()
 	if err != nil {
@@ -84,11 +85,36 @@ func TestPipelineKeepsWorldsInStep(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	p.drain()
+	if err := p.drain(); err != nil {
+		t.Fatal(err)
+	}
 	// prime runs the first Sense and drain the last Act: 301 ticks.
 	for i, w := range worlds {
 		if w.Tick != 301 {
 			t.Fatalf("world %d at tick %d after prime, 300 steps and drain", i, w.Tick)
+		}
+	}
+}
+
+// TestRunWorldsHonoursTicks checks that the pipeline's prime and drain do not
+// add ticks: 7 ticks in epochs of 3 must leave every world at tick 7.
+func TestRunWorldsHonoursTicks(t *testing.T) {
+	d, err := vk.Open()
+	if err != nil {
+		t.Skipf("no Vulkan device: %v", err)
+	}
+	d.Close()
+	sim.LoadConfig("config.yml")
+	sim.SavePath = t.TempDir() + "/colonies.json"
+	rand.Seed(3)
+	worlds := make([]*sim.World, 4)
+	for i := range worlds {
+		worlds[i] = sim.NewWorld()
+	}
+	runWorlds(worlds, 7, 3, time.Hour, true)
+	for i, w := range worlds {
+		if w.Tick != 7 {
+			t.Fatalf("world %d at tick %d, want 7", i, w.Tick)
 		}
 	}
 }
