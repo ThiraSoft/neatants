@@ -1,9 +1,10 @@
 package neat
 
 import (
+	"cmp"
 	"math"
 	"math/rand"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -130,7 +131,7 @@ type Genome struct {
 	Origin int `json:"origin,omitempty"`
 	Evals  int `json:"evals,omitempty"`
 
-	sorted []ConnGene // connections sorted by innovation, cached for Compatibility
+	sorted []innWeight // innovations and weights sorted by innovation, cached for Compatibility
 }
 
 // Advanced switches on the modern mutation scheme: self-adaptive strength,
@@ -586,7 +587,7 @@ func Crossover(better, other *Genome, childID int) *Genome {
 			child.Traits[i] = child.Traits[i]*t + other.Traits[i]*(1-t)
 		}
 	}
-	om := map[int]ConnGene{}
+	om := make(map[int]ConnGene, len(other.Conns))
 	for _, c := range other.Conns {
 		om[c.Innovation] = c
 	}
@@ -680,16 +681,47 @@ func Compatibility(a, b *Genome) float64 {
 	return float64(disjoint)/n + 0.4*avgW
 }
 
-// sortedConns returns the connections sorted by innovation. The result is
-// cached: genomes stored in pools are not modified any more (children are
-// copies), and Mutate drops the cache.
-func (g *Genome) sortedConns() []ConnGene {
+// innWeight is what Compatibility reads of a connection.
+type innWeight struct {
+	Innovation int
+	Weight     float64
+}
+
+// sortedConns returns the innovations and weights of the connections sorted
+// by innovation. Only those two fields are kept: sorting the whole genes
+// moved so much memory that it was half of a text-evolution generation once
+// genomes had a few thousand connections. The result is cached: genomes
+// stored in pools are not modified any more (children are copies), and
+// Mutate drops the cache.
+func (g *Genome) sortedConns() []innWeight {
 	if g.sorted != nil && len(g.sorted) == len(g.Conns) {
 		return g.sorted
 	}
-	c := make([]ConnGene, len(g.Conns))
-	copy(c, g.Conns)
-	sort.Slice(c, func(i, j int) bool { return c[i].Innovation < c[j].Innovation })
+	c := make([]innWeight, len(g.Conns))
+	// Innovations fit in 32 bits, so the sort runs on plain integers, the
+	// innovation above the index, which is several times faster than a
+	// sort with a comparison function; the order is the same.
+	keys := make([]uint64, len(g.Conns))
+	small := len(g.Conns) < 1<<32
+	for i, x := range g.Conns {
+		if x.Innovation < 0 || x.Innovation >= 1<<31 {
+			small = false
+			break
+		}
+		keys[i] = uint64(x.Innovation)<<32 | uint64(i)
+	}
+	if small {
+		slices.Sort(keys)
+		for i, k := range keys {
+			x := g.Conns[k&(1<<32-1)]
+			c[i] = innWeight{x.Innovation, x.Weight}
+		}
+	} else {
+		for i, x := range g.Conns {
+			c[i] = innWeight{x.Innovation, x.Weight}
+		}
+		slices.SortFunc(c, func(a, b innWeight) int { return cmp.Compare(a.Innovation, b.Innovation) })
+	}
 	g.sorted = c
 	return c
 }
