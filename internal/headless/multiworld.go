@@ -26,11 +26,7 @@ import (
 // RunWorlds evolves n worlds in parallel until ticks per world are done (0 = until
 // interrupted), exchanging champions every epoch ticks.
 func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool) {
-	worlds := make([]*sim.World, n)
-	for i := range worlds {
-		worlds[i] = sim.NewWorld()
-	}
-	runWorlds(worlds, ticks, epoch, every, gpu)
+	runWorlds(sim.NewWorlds(n), ticks, epoch, every, gpu)
 }
 
 // runWorlds is RunWorlds on worlds already built, so tests can inspect them.

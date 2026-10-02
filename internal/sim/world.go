@@ -381,7 +381,71 @@ type World struct {
 	lastPlagueLog int
 }
 
-func NewWorld() *World {
+// NewWorld builds one world from the save.
+func NewWorld() *World { return NewWorlds(1)[0] }
+
+// NewWorlds builds n worlds from one read of the save: parsing it is by far
+// the slowest part of a start, and every world needs the same content. Each
+// world gets its own copies of the genomes, halls, species and monster pool,
+// so no mutable genome is shared between two of them.
+func NewWorlds(n int) []*World {
+	restored := LoadSave()
+	worlds := make([]*World, n)
+	for i := range worlds {
+		worlds[i] = newWorld(restored.copy())
+	}
+	return worlds
+}
+
+// copy deep-copies what a world mutates. The pools need no copy here:
+// foundColony copies every genome it takes from them.
+func (r Restored) copy() Restored {
+	r.Monsters = copyGenomes(r.Monsters)
+	r.Species = append([]*Speciation(nil), r.Species...)
+	for i, s := range r.Species {
+		r.Species[i] = s.copy()
+	}
+	r.MonSpecies = r.MonSpecies.copy()
+	return r
+}
+
+// copyGenome is Genome.Copy that keeps the fitness: the monster hall and the
+// representatives are ranked by it, and the save carries it.
+func copyGenome(g *neat.Genome) *neat.Genome {
+	c := g.Copy()
+	c.Fitness = g.Fitness
+	return c
+}
+
+func copyGenomes(gs []*neat.Genome) []*neat.Genome {
+	if gs == nil {
+		return nil
+	}
+	out := make([]*neat.Genome, len(gs))
+	for i, g := range gs {
+		out[i] = copyGenome(g)
+	}
+	return out
+}
+
+// copy returns a registry sharing nothing with s. Members are rebuilt by the
+// next assign, so they are not carried over.
+func (s *Speciation) copy() *Speciation {
+	if s == nil {
+		return nil
+	}
+	c := *s
+	c.List = make([]*Species, len(s.List))
+	for i, sp := range s.List {
+		spc := *sp
+		spc.Rep = copyGenome(sp.Rep)
+		spc.Members = nil
+		c.List[i] = &spc
+	}
+	return &c
+}
+
+func newWorld(restored Restored) *World {
 	w := &World{
 		Cave:       Vec2{300 + rand.Float64()*(WorldW-600), 300 + rand.Float64()*(WorldH-600)},
 		NextWave:   Cfg.FirstWave,
@@ -402,7 +466,6 @@ func NewWorld() *World {
 	w.generateTerrain()
 	w.placeShop()
 
-	restored := LoadSave()
 	saved := restored.Pools
 	w.Evolved, w.Threat, w.MonHall = restored.Evolved, restored.Threat, restored.Monsters
 	if restored.MonSpecies != nil {
