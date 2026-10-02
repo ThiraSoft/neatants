@@ -14,6 +14,7 @@
 #define LANES 64u
 #endif
 layout(local_size_x = LANES) in;
+#include "neatmath.glsl"
 
 layout(std430, binding = 0) buffer Arena { uint arena[]; };
 layout(std430, binding = 1) readonly buffer Req { uint slots[]; };
@@ -36,23 +37,11 @@ layout(push_constant) uniform Push {
 #define VALS_OFF (PL_OFF + 4u * MAX_PLASTIC)
 #define CELL_OFF (VALS_OFF + MAX_NODES)
 #define SLOT_WORDS (CELL_OFF + MAX_NODES)
-#define MEMORY 4u
 
 // v[0, n) are the values of this tick. v[n, n+B) are the values of the
 // previous tick that some edge reads (the back edges): a kind word carries,
 // above its 8 kind bits, 1 + the place of its node's previous value in v.
 shared float v[MAX_VALUES];
-
-float fast_tanh(float x) {
-	if (x > 3.0) return 1.0;
-	if (x < -3.0) return -1.0;
-	precise float x2 = x * x;
-	precise float num = x * (27.0 + x2);
-	precise float den = 27.0 + 9.0 * x2;
-	return num / den;
-}
-float sig(float x) { precise float y = 0.5 + 0.5 * fast_tanh(2.45 * x); return y; }
-float sig01(float x) { precise float y = 0.5 + 0.5 * fast_tanh(0.5 * x); return y; }
 
 void main() {
 	uint r = gl_WorkGroupID.x;
