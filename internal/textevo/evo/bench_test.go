@@ -40,3 +40,21 @@ func BenchmarkNextRealistic(b *testing.B) {
 		p.Next(f)
 	}
 }
+
+// BenchmarkNextDense times a generation of a dense first population at D 128
+// (every output reads every input, 16512 connections a genome).
+func BenchmarkNextDense(b *testing.B) {
+	defer func(k int) { neat.MinimalLinks = k }(neat.MinimalLinks)
+	neat.MinimalLinks = 128
+	cfg := DefaultConfig()
+	cfg.Pop = 200
+	p := New(cfg, 128)
+	b.ResetTimer()
+	for range b.N {
+		f := make([]float64, len(p.Genomes))
+		for i := range f {
+			f[i] = rand.Float64()
+		}
+		p.Next(f)
+	}
+}

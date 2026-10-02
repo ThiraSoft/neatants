@@ -2,6 +2,7 @@ package evo
 
 import (
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/ThiraSoft/neatants/neat"
@@ -109,5 +110,87 @@ func TestSpeciesStayInBand(t *testing.T) {
 	t.Logf("species per generation: %v, threshold %.4f", counts, p.Threshold)
 	if in < 40 {
 		t.Fatalf("only %d of the last 50 generations have %d to %d species", in, cfg.MinSpecies, cfg.MaxSpecies)
+	}
+}
+
+// speciateSequential is the one-genome-at-a-time speciation the parallel one
+// must reproduce: each genome joins the first species, in registry order,
+// whose representative is close enough, the species created earlier in the
+// same pass included, or founds a new one.
+func speciateSequential(species []*Species, genomes []*neat.Genome, threshold float64) [][]int {
+	var reps []*neat.Genome
+	for _, sp := range species {
+		reps = append(reps, sp.Rep)
+	}
+	members := make([][]int, len(reps))
+	for _, g := range genomes {
+		home := -1
+		for k, r := range reps {
+			if neat.Compatibility(g, r) < threshold {
+				home = k
+				break
+			}
+		}
+		if home < 0 {
+			reps = append(reps, g)
+			members = append(members, nil)
+			home = len(reps) - 1
+		}
+		members[home] = append(members[home], g.ID)
+	}
+	var out [][]int
+	for _, m := range members {
+		if len(m) > 0 {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// The parallel speciation must give the same species, with the same members
+// in the same order, as the sequential pass, both when most genomes find an
+// existing species and when many found new ones in the same generation.
+func TestParallelSpeciationMatchesSequential(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Pop = 300
+	p := New(cfg, 16)
+	for gen := range 30 {
+		fit := scores(p, toy)
+		p.record(fit)
+		for _, th := range []float64{p.Threshold, p.Threshold / 4} {
+			saved := p.Threshold
+			p.Threshold = th
+			species := make([]*Species, len(p.Species))
+			for i, sp := range p.Species {
+				c := *sp
+				species[i] = &c
+			}
+			want := speciateSequential(p.Species, p.Genomes, th)
+			q := *p
+			q.Species = species
+			q.speciate()
+			var got [][]int
+			for _, sp := range q.Species {
+				var ids []int
+				for _, g := range sp.Members {
+					ids = append(ids, g.ID)
+				}
+				got = append(got, ids)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("gen %d threshold %g: %d species, sequential %d", gen, th, len(got), len(want))
+			}
+			for k := range want {
+				if !slices.Equal(got[k], want[k]) {
+					t.Fatalf("gen %d threshold %g: species %d has %v, sequential %v", gen, th, k, got[k], want[k])
+				}
+			}
+			p.Threshold = saved
+		}
+		// The real step, so that the next generation starts from it.
+		for _, g := range p.Genomes {
+			g.Evals = 0
+		}
+		p.Next(fit)
 	}
 }

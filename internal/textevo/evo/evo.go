@@ -5,7 +5,10 @@ package evo
 import (
 	"math"
 	"math/rand"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/ThiraSoft/neatants/internal/textevo/model"
 	"github.com/ThiraSoft/neatants/neat"
@@ -127,24 +130,48 @@ func (p *Population) record(fitness []float64) {
 // speciate sorts the genomes into the species of the previous generation,
 // creating species for those that fit none, as in the steady-state version
 // of internal/sim but over a whole generation.
+//
+// Comparing a genome with the representatives is most of the work and runs on
+// every core: each genome finds the first of the previous generation's
+// species it fits, against that frozen list. The genomes that fit none then
+// go through the species founded in this pass one by one, in genome order,
+// so the result is exactly that of the sequential pass whatever the
+// scheduling.
 func (p *Population) speciate() {
+	old := len(p.Species)
 	for _, sp := range p.Species {
 		sp.Members = sp.Members[:0]
+		sp.Rep.PrepareCompatibility()
 	}
-	for _, g := range p.Genomes {
-		var home *Species
-		for _, sp := range p.Species {
+	home := make([]int, len(p.Genomes))
+	parallel(len(p.Genomes), func(i int) {
+		g := p.Genomes[i]
+		home[i] = -1
+		for k, sp := range p.Species[:old] {
 			if neat.Compatibility(g, sp.Rep) < p.Threshold {
-				home = sp
+				home[i] = k
 				break
 			}
 		}
-		if home == nil {
-			p.nextSpec++
-			home = &Species{ID: p.nextSpec, Rep: g, Best: g.Fitness, Improved: p.Gen}
-			p.Species = append(p.Species, home)
+	})
+	for i, g := range p.Genomes {
+		var sp *Species
+		if home[i] >= 0 {
+			sp = p.Species[home[i]]
+		} else {
+			for _, s := range p.Species[old:] {
+				if neat.Compatibility(g, s.Rep) < p.Threshold {
+					sp = s
+					break
+				}
+			}
 		}
-		home.Members = append(home.Members, g)
+		if sp == nil {
+			p.nextSpec++
+			sp = &Species{ID: p.nextSpec, Rep: g, Best: g.Fitness, Improved: p.Gen}
+			p.Species = append(p.Species, sp)
+		}
+		sp.Members = append(sp.Members, g)
 	}
 	alive := p.Species[:0]
 	for _, sp := range p.Species {
@@ -231,9 +258,21 @@ func (p *Population) allocate() []int {
 	return shares
 }
 
-// breed makes the next generation, species by species.
+// breed makes the next generation, species by species. The children are
+// listed first, in species order with their IDs, then made on every core.
+// Crossover and Mutate only read the parents, draw from the global source
+// (safe for concurrent use) and number new genes under neat's history lock,
+// so making them at once is safe. What is not deterministic for a given
+// source state: which child gets which draws, and so the innovation and node
+// numbers of new structure. The number of children per species, their slots
+// and IDs are.
 func (p *Population) breed(shares []int) []*neat.Genome {
-	children := make([]*neat.Genome, 0, p.cfg.Pop)
+	type job struct {
+		champ   *neat.Genome   // carried over unchanged, or nil
+		parents []*neat.Genome // the parents of a bred child
+		id      int
+	}
+	var jobs []job
 	for si, sp := range p.Species {
 		share := shares[si]
 		if share == 0 {
@@ -242,44 +281,82 @@ func (p *Population) breed(shares []int) []*neat.Genome {
 		ms := append([]*neat.Genome(nil), sp.Members...)
 		sort.SliceStable(ms, func(a, b int) bool { return ms[a].Fitness > ms[b].Fitness })
 		if len(ms) >= p.cfg.ChampionMin {
-			// The champion is carried over untouched: its Origin lets the
-			// evaluator average its next score with this one.
-			c := ms[0].Copy()
-			c.Fitness = ms[0].Fitness
-			c.Origin = ms[0].Lineage()
-			c.ID = p.id()
-			children = append(children, c)
+			jobs = append(jobs, job{champ: ms[0], id: p.id()})
 			share--
 		}
 		parents := ms[:max(1, int(math.Ceil(p.cfg.Survival*float64(len(ms)))))]
 		for ; share > 0; share-- {
-			var c *neat.Genome
-			if rand.Float64() < p.cfg.MutateOnly {
-				c = parents[rand.Intn(len(parents))].Copy()
-				c.ID = p.id()
-			} else {
-				a := parents[rand.Intn(len(parents))]
-				b := parents[rand.Intn(len(parents))]
-				if rand.Float64() < p.cfg.Interspecies && len(p.Species) > 1 {
-					other := p.Species[rand.Intn(len(p.Species))]
-					b = other.Members[rand.Intn(len(other.Members))]
-				}
-				if b.Fitness > a.Fitness {
-					a, b = b, a
-				}
-				c = neat.Crossover(a, b, p.id())
-			}
-			c.Mutate()
-			if len(c.Traits) == 0 {
-				c.Traits = neat.RandomTraits(1)
-			}
-			children = append(children, c)
+			jobs = append(jobs, job{parents: parents, id: p.id()})
 		}
 	}
+	children := make([]*neat.Genome, len(jobs))
+	parallel(len(jobs), func(i int) {
+		j := jobs[i]
+		if j.champ != nil {
+			// The champion is carried over untouched: its Origin lets the
+			// evaluator average its next score with this one.
+			c := j.champ.Copy()
+			c.Fitness = j.champ.Fitness
+			c.Origin = j.champ.Lineage()
+			c.ID = j.id
+			children[i] = c
+			return
+		}
+		children[i] = p.child(j.parents, j.id)
+	})
 	return children
+}
+
+// child breeds one genome from parents, by mutation alone or by crossover,
+// rarely with a mate from another species.
+func (p *Population) child(parents []*neat.Genome, id int) *neat.Genome {
+	var c *neat.Genome
+	if rand.Float64() < p.cfg.MutateOnly {
+		c = parents[rand.Intn(len(parents))].Copy()
+		c.ID = id
+	} else {
+		a := parents[rand.Intn(len(parents))]
+		b := parents[rand.Intn(len(parents))]
+		if rand.Float64() < p.cfg.Interspecies && len(p.Species) > 1 {
+			other := p.Species[rand.Intn(len(p.Species))]
+			b = other.Members[rand.Intn(len(other.Members))]
+		}
+		if b.Fitness > a.Fitness {
+			a, b = b, a
+		}
+		c = neat.Crossover(a, b, id)
+	}
+	c.Mutate()
+	if len(c.Traits) == 0 {
+		c.Traits = neat.RandomTraits(1)
+	}
+	return c
 }
 
 func (p *Population) id() int {
 	p.nextID++
 	return p.nextID - 1
+}
+
+// parallel calls f(i) for i in [0, n) on every core. Indexes are handed out
+// one at a time, since the cost of an item varies a lot (a genome may meet
+// its species first or compare with all of them).
+func parallel(n int, f func(i int)) {
+	workers := min(runtime.GOMAXPROCS(0), n)
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= n {
+					return
+				}
+				f(i)
+			}
+		}()
+	}
+	wg.Wait()
 }

@@ -681,6 +681,11 @@ func Compatibility(a, b *Genome) float64 {
 	return float64(disjoint)/n + 0.4*avgW
 }
 
+// PrepareCompatibility fills the cache Compatibility reads, so that several
+// goroutines may then compare g at once: the cache is otherwise filled on
+// first use, which would be a race between them.
+func (g *Genome) PrepareCompatibility() { g.sortedConns() }
+
 // innWeight is what Compatibility reads of a connection.
 type innWeight struct {
 	Innovation int
