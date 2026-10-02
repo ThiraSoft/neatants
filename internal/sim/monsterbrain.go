@@ -116,12 +116,9 @@ func (w *World) adaptThreat() {
 	w.antDeaths, w.antsByMonsters = 0, 0
 }
 
-// monsterThink fills the brain's senses and returns its outputs, or nil
-// when monsters have no brain.
-func (w *World) monsterThink(m *Monster, prey *Ant, preyD, senseR float64) []float64 {
-	if m.Net == nil {
-		return nil
-	}
+// monsterSenses fills the brain's senses from the prey chosen at Sense.
+func (w *World) monsterSenses(m *Monster) {
+	prey, preyD, senseR := m.prey, m.preyD, m.senseR
 	in := m.sense[:]
 	rel := func(p Vec2) (float64, float64) {
 		d := p.Sub(m.Pos)
@@ -166,5 +163,39 @@ func (w *World) monsterThink(m *Monster, prey *Ant, preyD, senseR float64) []flo
 	in[17] = float64(m.Age) / float64(max(1, m.MaxAge))
 	in[18] = pain(m.feltHP, m.HP, m.MaxHP)
 	m.feltHP = m.HP
-	return think(m.Net, in, m.out[:])
+}
+
+// monsterPrey picks the nearest ant within reach: the monster chases it
+// unless its brain prefers the nest.
+func (w *World) monsterPrey(m *Monster) (prey *Ant, preyD, senseR float64) {
+	preyD = 140.0
+	if m.Kind == MonGolem {
+		preyD = 90
+	}
+	senseR = preyD
+	w.forAntsNear(m.Pos, preyD, func(a *Ant, d float64) {
+		if d < preyD {
+			prey, preyD = a, d
+		}
+	})
+	return prey, preyD, senseR
+}
+
+// senseMonsters chooses every monster's prey and target and, for the
+// monsters with a brain, fills their senses and lists their Thought.
+func (w *World) senseMonsters() {
+	for _, m := range w.Monsters {
+		if !m.Alive {
+			continue
+		}
+		if m.Target < 0 || !w.Colonies[m.Target].Alive {
+			m.Target = w.pickTarget(m.Pos)
+		}
+		m.prey, m.preyD, m.senseR = w.monsterPrey(m)
+		m.sensedAt = w.Tick
+		if m.Net != nil {
+			w.monsterSenses(m)
+			w.Thoughts = append(w.Thoughts, Thought{m.Net, m.sense[:], m.out[:]})
+		}
+	}
 }

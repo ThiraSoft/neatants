@@ -5,7 +5,6 @@ import (
 	"github.com/ThiraSoft/neatants/neat"
 	"math"
 	"math/rand"
-	"runtime"
 	"sync"
 )
 
@@ -350,8 +349,10 @@ type World struct {
 	antHash cellIndex // ants per hash cell
 	monHash cellIndex // monsters per hash cell
 
-	outs [][]float64 // brain outputs of the tick, reused
-	wg   sync.WaitGroup
+	Thoughts []Thought // brains to evaluate this tick, between Sense and Act
+	thinkers []*Ant    // the ants of Thoughts, in order
+	sensed   int       // len(Ants) at Sense: the ants that act this tick
+	wg       sync.WaitGroup
 	// serialBrains runs every brain on the world's own goroutine: when
 	// several worlds evolve side by side, each one already fills a core.
 	SerialBrains bool
@@ -852,104 +853,7 @@ func (w *World) forMonstersNear(p Vec2, r float64, fn func(m *Monster, d float64
 
 // --- Main update ---
 
-// Brain workers live for the whole program and block on a channel between
-// ticks: no goroutine (and no stack) is created or freed per tick.
-type brainJob struct {
-	w    *World
-	s, e int
-}
-
-var brainJobs = func() chan brainJob {
-	jobs := make(chan brainJob, 64)
-	for range runtime.NumCPU() {
-		go func() {
-			for j := range jobs {
-				j.w.brainChunk(j.s, j.e)
-			}
-		}()
-	}
-	return jobs
-}()
-
-// runBrains splits the ants in chunks of at least minBrainChunk (waking a
-// worker costs a few microseconds, tiny chunks are not worth it) and runs
-// the last chunk on the calling goroutine itself.
-func (w *World) runBrains() {
-	n := len(w.Ants)
-	if w.SerialBrains {
-		w.wg.Add(1)
-		w.brainChunk(0, n)
-		return
-	}
-	parts := min(runtime.NumCPU(), max(1, n/minBrainChunk))
-	chunk := (n + parts - 1) / parts
-	for s := chunk; s < n; s += chunk {
-		w.wg.Add(1)
-		brainJobs <- brainJob{w, s, min(s+chunk, n)}
-	}
-	w.wg.Add(1)
-	w.brainChunk(0, min(chunk, n))
-	w.wg.Wait()
-}
-
 var minBrainChunk = 8
-
-// brainChunk reads the senses and runs the networks of ants [s, e). With
-// think_every > 1 each ant thinks on its own turn (staggered by ID so the
-// load stays even) and keeps acting on its last decision in between.
-func (w *World) brainChunk(s, e int) {
-	defer w.wg.Done()
-	every := max(1, Cfg.ThinkEvery)
-	for i := s; i < e; i++ {
-		a := w.Ants[i]
-		if !a.Alive {
-			continue
-		}
-		if every > 1 && (w.Tick+a.ID)%every != 0 {
-			w.outs[i] = a.lastOut[:]
-			continue
-		}
-		w.fillInputs(a, a.Sense[:])
-		w.outs[i] = think(a.Net, a.Sense[:], a.lastOut[:])
-	}
-}
-
-func (w *World) Update() bool {
-	w.Tick++
-	w.Clock = math.Sin(float64(w.Tick) * clockFreq)
-	w.Evolved++
-	w.rebuildGrids()
-	w.updateBushFood()
-
-	// Phase 1: brains in parallel
-	if cap(w.outs) < len(w.Ants) {
-		w.outs = make([][]float64, len(w.Ants), len(w.Ants)*2)
-	}
-	w.outs = w.outs[:len(w.Ants)]
-	outs := w.outs
-	clear(outs)
-	w.runBrains()
-
-	// Phase 2: act
-	for i, a := range w.Ants {
-		if a.Alive && outs[i] != nil {
-			w.stepAnt(a, outs[i])
-		}
-	}
-	w.updateFireballs()
-	w.updateMonsters()
-	w.updateColonies()
-	w.updateMarriages()
-	w.rechargeElements()
-	w.updateWaves()
-	w.updateShop()
-	w.updateWeird()
-	w.updateWeather()
-	w.updateFoodAndPhero()
-	w.cleanup()
-
-	return w.Tick%Cfg.SaveEvery == 0
-}
 
 // clockFreq sets the period of World.Clock: about 209 ticks.
 const clockFreq = 0.03
@@ -1945,16 +1849,3 @@ func (w *World) relocateNest(c *Colony) {
 
 // V builds a Vec2 from its coordinates.
 func V(x, y float64) Vec2 { return Vec2{x, y} }
-
-// think runs net on the float64 senses of the simulation and writes its
-// outputs into out, which it returns. Networks compute in float32.
-func think(net *neat.Network, in, out []float64) []float64 {
-	var buf [max(AntInputs, MonInputs)]float32
-	for i, x := range in {
-		buf[i] = float32(x)
-	}
-	for i, x := range net.Activate(buf[:len(in)]) {
-		out[i] = float64(x)
-	}
-	return out
-}

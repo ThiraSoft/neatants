@@ -69,6 +69,10 @@ type Monster struct {
 	LastHurtByAnt int
 	sense         [MonInputs]float64
 	out           [MonOutputs]float64
+	// Chosen at Sense, used at Act (see senseMonsters).
+	prey          *Ant
+	preyD, senseR float64
+	sensedAt      int
 	feltHP        float64 // HP at the last thought, for the pain input
 }
 
@@ -224,8 +228,11 @@ func colonyWealth(c *Colony) float64 {
 func (w *World) updateMonsters() {
 	for _, m := range w.Monsters {
 		if !m.Alive {
+			m.prey = nil
 			continue
 		}
+		prey, preyD := m.prey, m.preyD
+		m.prey = nil // a monster that dies below must not keep its prey
 		m.Prev = m.Pos
 		m.Spawn = math.Min(1, m.Spawn+0.02)
 		m.Flash *= 0.85
@@ -271,18 +278,16 @@ func (w *World) updateMonsters() {
 		// the nest even with ants around.
 		var goal Vec2
 		hasGoal := false
-		var prey *Ant
-		preyD := 140.0
-		if m.Kind == MonGolem {
-			preyD = 90
+		var o []float64
+		if m.sensedAt != w.Tick {
+			// Born during this Act: no senses yet, the script alone drives.
+			prey, preyD, _ = w.monsterPrey(m)
+		} else if m.Net != nil {
+			o = m.out[:]
 		}
-		senseR := preyD
-		w.forAntsNear(m.Pos, preyD, func(a *Ant, d float64) {
-			if d < preyD {
-				prey, preyD = a, d
-			}
-		})
-		o := w.monsterThink(m, prey, preyD, senseR)
+		if prey != nil && !prey.Alive {
+			prey = nil
+		}
 		chase := prey != nil && (o == nil || o[2] >= 0.5 || m.Target < 0)
 		if chase {
 			goal, hasGoal = prey.Pos, true

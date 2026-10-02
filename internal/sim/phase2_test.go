@@ -16,20 +16,14 @@ func BenchmarkTickPhases(b *testing.B) {
 	var tGrid, tBrain, tAct, tRest time.Duration
 	b.ResetTimer()
 	for range b.N {
-		w.Tick++
 		t0 := time.Now()
-		w.rebuildGrids()
+		w.Sense()
 		t1 := time.Now()
-		if cap(w.outs) < len(w.Ants) {
-			w.outs = make([][]float64, len(w.Ants), len(w.Ants)*2)
-		}
-		w.outs = w.outs[:len(w.Ants)]
-		clear(w.outs)
-		w.runBrains()
+		w.ThinkCPU()
 		t2 := time.Now()
-		for i, a := range w.Ants {
-			if a.Alive && w.outs[i] != nil {
-				w.stepAnt(a, w.outs[i])
+		for _, a := range w.Ants[:w.sensed] {
+			if a.Alive {
+				w.stepAnt(a, a.lastOut[:])
 			}
 		}
 		t3 := time.Now()
@@ -53,5 +47,5 @@ func BenchmarkTickPhases(b *testing.B) {
 	}
 	n := float64(b.N)
 	us := func(d time.Duration) float64 { return float64(d.Nanoseconds()) / n / 1000 }
-	fmt.Printf("\ngrids %.1f µs · brains (parallel) %.1f µs · actions %.1f µs · rest %.1f µs\n", us(tGrid), us(tBrain), us(tAct), us(tRest))
+	fmt.Printf("\nsense %.1f µs · brains (parallel) %.1f µs · actions %.1f µs · rest %.1f µs\n", us(tGrid), us(tBrain), us(tAct), us(tRest))
 }
