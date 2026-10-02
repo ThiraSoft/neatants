@@ -1,0 +1,126 @@
+#version 450
+// One workgroup runs one (genome, window) pair over the whole window: the
+// state of the network (values, LSTM cells, plastic weights) stays in shared
+// memory from the first tick to the last, so a generation is one dispatch and
+// the only global writes are the output vectors of the scored ticks. Each
+// tick computes exactly what neat.Flat.Activate computes.
+
+#ifndef LANES
+#define LANES 64u
+#endif
+layout(local_size_x = LANES) in;
+
+#include "neatmath.glsl"
+
+// gen: [starts K][scale G][goff G][records], see pack.go.
+layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
+layout(std430, binding = 1) readonly buffer Tokens { uint tokens[]; };
+layout(std430, binding = 2) readonly buffer Emb { float emb[]; };
+layout(std430, binding = 3) writeonly buffer Rows { uint rows[]; }; // two halves per word
+
+layout(push_constant) uniform Push {
+	uint pairs;
+	uint windows;
+	uint len;
+	uint warm;
+	uint dim;
+	uint startsOff;
+	uint goffOff;
+} pc;
+
+shared float v[MAX_VALUES];
+shared float cell[MAX_NODES];
+shared float pw[MAX_PLASTIC];
+
+void main() {
+	uint p = gl_WorkGroupID.x;
+	if (p >= pc.pairs) return;
+	uint lane = gl_LocalInvocationID.x;
+	uint g = p / pc.windows, w = p % pc.windows;
+	uint b = gw[pc.goffOff + g];
+	uint n = gw[b], nOrder = gw[b + 1u], nLevels = gw[b + 2u], nPlastic = gw[b + 3u];
+	uint inStart = gw[b + 4u], inEnd = gw[b + 5u], outStart = gw[b + 6u];
+	uint kindOff = b + 8u;
+	uint levelOff = kindOff + n;
+	uint orderOff = levelOff + nLevels + 1u;
+	uint offOff = orderOff + nOrder;
+	uint nEdges = gw[offOff + 4u * n];
+	uint edgeOff = offOff + 4u * n + 1u;
+	uint plOff = edgeOff + 2u * nEdges;
+	uint start = gw[pc.startsOff + w];
+	uint scored = pc.len - pc.warm;
+	uint hd = pc.dim / 2u;
+
+	for (uint i = lane; i < n; i += LANES) {
+		v[i] = 0.0;
+		cell[i] = 0.0;
+	}
+	for (uint q = lane; q < nPlastic; q += LANES) pw[q] = uintBitsToFloat(gw[edgeOff + 2u * gw[plOff + 4u * q] + 1u]);
+	barrier();
+
+	for (uint t = 0u; t < pc.len; t++) {
+		uint row = tokens[start + t] * pc.dim;
+		// Bias and inputs, then the previous-tick copies, as Flat.Activate
+		// sets the inputs before it copies the values.
+		for (uint x = lane; x < n; x += LANES) {
+			float y = v[x];
+			if (x == 0u) y = 1.0;
+			else if (x >= inStart && x < inEnd) y = emb[row + (x - inStart)];
+			v[x] = y;
+			uint back = gw[kindOff + x] >> 8;
+			if (back != 0u) v[n + back - 1u] = y;
+		}
+		barrier();
+
+		for (uint l = 0u; l < nLevels; l++) {
+			uint s = gw[levelOff + l], e = gw[levelOff + l + 1u];
+			for (uint j = s + lane; j < e; j += LANES) {
+				uint ni = gw[orderOff + j];
+				uint gb = offOff + ni * 4u;
+				bool mem = (gw[kindOff + ni] & 0xFFu) == MEMORY;
+				uint o0 = gw[gb], o1 = gw[gb + 1u], o2 = gw[gb + 2u], o3 = gw[gb + 3u], o4 = gw[gb + 4u];
+				precise float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+				uint end = mem ? o4 : o1;
+				for (uint k = o0; k < end; k++) {
+					uint fw = gw[edgeOff + 2u * k];
+					uint pl = (fw >> 16) & 0x7FFFu;
+					float wt = pl != 0u ? pw[pl - 1u] : uintBitsToFloat(gw[edgeOff + 2u * k + 1u]);
+					precise float prod = v[fw & 0xFFFFu] * wt;
+					if (k < o1) s0 = s0 + prod;
+					else if (k < o2) s1 = s1 + prod;
+					else if (k < o3) s2 = s2 + prod;
+					else s3 = s3 + prod;
+				}
+				if (!mem) {
+					v[ni] = sig(s0);
+				} else {
+					precise float ig = sig01(s1 + 2.0);
+					precise float fg = sig01(s2 + 2.0);
+					precise float og = sig01(s3 + 2.0);
+					precise float c = fg * cell[ni] + ig * fast_tanh(s0);
+					cell[ni] = c;
+					precise float y = og * fast_tanh(c);
+					v[ni] = y;
+				}
+			}
+			barrier();
+		}
+
+		if (t >= pc.warm) {
+			uint r = (p * scored + (t - pc.warm)) * hd;
+			for (uint j = lane; j < hd; j += LANES) {
+				uint o = outStart + 2u * j;
+				rows[r + j] = packHalf2x16(vec2(2.0 * v[o] - 1.0, 2.0 * v[o + 1u] - 1.0));
+			}
+		}
+		for (uint q = lane; q < nPlastic; q += LANES) {
+			uint at = plOff + 4u * q;
+			float pre = v[gw[at + 1u]], post = v[gw[at + 2u]];
+			float eta = uintBitsToFloat(gw[at + 3u]);
+			float wq = pw[q];
+			precise float nw = wq + eta * post * (pre - post * wq);
+			pw[q] = clamp(nw, -8.0, 8.0);
+		}
+		barrier();
+	}
+}
