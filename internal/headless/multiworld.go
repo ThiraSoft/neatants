@@ -2,6 +2,7 @@ package headless
 
 import (
 	"fmt"
+	"github.com/ThiraSoft/golem/vk"
 	"github.com/ThiraSoft/neatants/internal/sim"
 	"github.com/ThiraSoft/neatants/neat"
 	"os"
@@ -24,11 +25,27 @@ import (
 
 // RunWorlds evolves n worlds in parallel until ticks per world are done (0 = until
 // interrupted), exchanging champions every epoch ticks.
-func RunWorlds(n, ticks, epoch int, every time.Duration) {
+func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool) {
 	worlds := make([]*sim.World, n)
 	for i := range worlds {
 		worlds[i] = sim.NewWorld()
 		worlds[i].SerialBrains = true
+	}
+	var g *group
+	if gpu {
+		d, err := vk.Open()
+		if err == nil {
+			g, err = newGroup(d, worlds)
+			if err != nil {
+				d.Close()
+			} else {
+				defer d.Close()
+				defer g.close()
+			}
+		}
+		if err != nil {
+			fmt.Printf("[HEADLESS] no usable GPU (%v), thinking on the CPU\n", err)
+		}
 	}
 	var stopped atomic.Bool
 	stop := make(chan os.Signal, 1)
@@ -48,7 +65,31 @@ func RunWorlds(n, ticks, epoch int, every time.Duration) {
 		}
 		ran := make([]int, n)
 		var wg sync.WaitGroup
+		if g != nil {
+			// Lockstep: every world ticks together, so they all ran the same count.
+			count := 0
+			for k := 0; k < steps && !(k%500 == 0 && stopped.Load()); k++ {
+				g.sense()
+				err := g.start()
+				if err == nil {
+					err = g.finish()
+				}
+				if err != nil {
+					saveMerged(worlds)
+					fmt.Fprintf(os.Stderr, "[HEADLESS] GPU error, lineages saved: %v\n", err)
+					os.Exit(1)
+				}
+				g.act()
+				count++
+			}
+			for i := range ran {
+				ran[i] = count
+			}
+		}
 		for i, w := range worlds {
+			if g != nil {
+				break
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -74,6 +115,10 @@ func RunWorlds(n, ticks, epoch int, every time.Duration) {
 			tps := float64(done-lastDone) / time.Since(last).Seconds()
 			last, lastDone = time.Now(), done
 			reportWorlds(worlds, tps, time.Since(start))
+			if g != nil {
+				up, freed, cpu := g.batch.Stats()
+				fmt.Printf("  GPU: %d networks uploaded, %d freed, %d run on the CPU\n", up, freed, cpu)
+			}
 		}
 	}
 	saveMerged(worlds)

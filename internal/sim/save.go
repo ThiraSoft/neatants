@@ -6,12 +6,11 @@ import (
 	"github.com/ThiraSoft/neatants/neat"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-const (
-	SavePath     = "saves/colonies.json"
-	prevSavePath = "saves/colonies.prev.json"
-)
+// SavePath is a variable so tests can point the saves to a temporary folder.
+var SavePath = "saves/colonies.json"
 
 type SaveData struct {
 	Tick       int            `json:"tick"`
@@ -138,7 +137,7 @@ func WriteSave(s SaveData) {
 		return
 	}
 	if _, err := os.Stat(SavePath); err == nil {
-		os.Rename(SavePath, prevSavePath)
+		os.Rename(SavePath, strings.TrimSuffix(SavePath, ".json")+".prev.json")
 	}
 	os.Rename(tmp, SavePath)
 }

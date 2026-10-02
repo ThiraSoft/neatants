@@ -27,13 +27,19 @@ func main() {
 	config := flag.String("config", "config.yml", "configuration file")
 	worlds := flag.Int("worlds", runtime.NumCPU(), "worlds evolving in parallel (1 = a single world, brains spread over the cores)")
 	epoch := flag.Int("migrate", 20000, "ticks between two champion migrations from one world to the next")
+	gpu := flag.Bool("gpu", false, "think on the GPU (Vulkan), batching every world's brains")
 	flag.Parse()
+	given := false
+	flag.Visit(func(f *flag.Flag) { given = given || f.Name == "worlds" })
+	if *gpu && !given {
+		*worlds = 48
+	}
 
 	// The simulation allocates little per tick: fewer, larger GC cycles.
 	debug.SetGCPercent(400)
 	sim.LoadConfig(*config)
-	if *worlds > 1 {
-		headless.RunWorlds(*worlds, *ticks, max(500, *epoch), *every)
+	if *worlds > 1 || *gpu {
+		headless.RunWorlds(*worlds, *ticks, max(500, *epoch), *every, *gpu)
 		return
 	}
 	w := sim.NewWorld()
