@@ -3,6 +3,7 @@ package headless
 import (
 	"math/rand"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -116,5 +117,60 @@ func TestRunWorldsHonoursTicks(t *testing.T) {
 		if w.Tick != 7 {
 			t.Fatalf("world %d at tick %d, want 7", i, w.Tick)
 		}
+	}
+}
+
+// TestRunWorldsStopsAndSaves runs the GPU runner for a fixed number of ticks
+// with an epoch shorter than the run: it must return, with the save written.
+// WriteSave skips colonies without a hall of fame, so the run must be long
+// enough for some ants to die and fill one.
+func TestRunWorldsStopsAndSaves(t *testing.T) {
+	d, err := vk.Open()
+	if err != nil {
+		t.Skipf("no Vulkan device: %v", err)
+	}
+	d.Close()
+	sim.LoadConfig("config.yml")
+	sim.SavePath = t.TempDir() + "/colonies.json"
+	waitReturn(t, func() { RunWorlds(4, 6000, 500, time.Hour, true) })
+	if _, err := os.Stat(sim.SavePath); err != nil {
+		t.Fatalf("no save after the run: %v", err)
+	}
+}
+
+// TestRunWorldsInterrupted sends SIGINT to an unbounded run, as Ctrl+C does:
+// the pipeline must drain, save and return, for several worlds and for one.
+func TestRunWorldsInterrupted(t *testing.T) {
+	d, err := vk.Open()
+	if err != nil {
+		t.Skipf("no Vulkan device: %v", err)
+	}
+	d.Close()
+	sim.LoadConfig("config.yml")
+	for _, n := range []int{4, 1} {
+		sim.SavePath = t.TempDir() + "/colonies.json"
+		go func() {
+			time.Sleep(12 * time.Second) // long enough for a hall of fame to fill
+			syscall.Kill(os.Getpid(), syscall.SIGINT)
+		}()
+		waitReturn(t, func() { RunWorlds(n, 0, 100000, time.Hour, true) })
+		if _, err := os.Stat(sim.SavePath); err != nil {
+			t.Fatalf("%d worlds: no save after Ctrl+C: %v", n, err)
+		}
+	}
+}
+
+// waitReturn fails the test if f does not return within five minutes.
+func waitReturn(t *testing.T, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		f()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Minute):
+		t.Fatal("RunWorlds did not return")
 	}
 }
