@@ -1,7 +1,5 @@
 package neat
 
-import "sort"
-
 // Flat is a compiled network as plain arrays, its nodes sorted by level: a
 // node only reads, from this tick, nodes of lower levels (inputs and bias are
 // level 0), so the nodes of one level can be computed in any order or all at
@@ -68,13 +66,31 @@ func (n *Network) Flat() *Flat {
 		}
 		level[ni] = l + 1
 	}
-	f.Order = append([]int32(nil), n.order...)
-	sort.SliceStable(f.Order, func(a, b int) bool { return level[f.Order[a]] < level[f.Order[b]] })
+	// A stable counting sort of the order by level: the same result as a
+	// stable sort, without its cost on networks of a thousand nodes.
+	top := int32(0)
+	for _, ni := range n.order {
+		top = max(top, level[ni])
+	}
+	count := make([]int32, top+2)
+	for _, ni := range n.order {
+		count[level[ni]+1]++
+	}
+	for l := 1; l < len(count); l++ {
+		count[l] += count[l-1]
+	}
+	f.Order = make([]int32, len(n.order))
+	at := append([]int32(nil), count...)
+	for _, ni := range n.order {
+		f.Order[at[level[ni]]] = ni
+		at[level[ni]]++
+	}
+	// Levels start at 1 (inputs and bias are 0), so count[1:] are the
+	// starts of the non-empty levels, every level from 1 to top having a
+	// node by construction.
 	f.LevelStart = []int32{0}
-	for i := 1; i <= len(f.Order); i++ {
-		if i == len(f.Order) || level[f.Order[i]] != level[f.Order[i-1]] {
-			f.LevelStart = append(f.LevelStart, int32(i))
-		}
+	for l := int32(1); l <= top; l++ {
+		f.LevelStart = append(f.LevelStart, count[l+1])
 	}
 	f.kindCache = append([]NodeType(nil), n.kind...)
 	f.plasticCache = append([]plasticLink(nil), n.plastic...)

@@ -1,5 +1,7 @@
 package neat
 
+import "sync"
+
 // Gates of a Memory node. Plain nodes only use GateIn.
 const (
 	GateIn     uint8 = iota // candidate value
@@ -44,10 +46,8 @@ type Network struct {
 }
 
 func (g *Genome) BuildNetwork() *Network {
-	idMap := make(map[int]int, len(g.Nodes))
-	for i, node := range g.Nodes {
-		idMap[node.ID] = i
-	}
+	idx := newIDIndex(g.Nodes)
+	defer idx.release()
 	nc := len(g.Nodes)
 	n := &Network{
 		vals:     make([]float32, 2*nc),
@@ -72,10 +72,12 @@ func (g *Genome) BuildNetwork() *Network {
 		w, hebb    float64
 	}
 	edges := make([]edge, 0, len(g.Conns))
-	deps := make([][]int, nc)
+	// deps[depAt[t]:depAt[t+1]] are the sources of node t, in the order of
+	// the connections, as one slice instead of a slice per node.
+	depAt := make([]int32, nc+1)
 	for _, c := range g.Conns {
-		fi, okIn := idMap[c.In]
-		ti, okOut := idMap[c.Out]
+		fi, okIn := idx.get(c.In)
+		ti, okOut := idx.get(c.Out)
 		if !c.Enabled || !okIn || !okOut {
 			continue
 		}
@@ -86,7 +88,17 @@ func (g *Genome) BuildNetwork() *Network {
 		slot := ti*int(NumGates) + int(gate)
 		edges = append(edges, edge{fi, slot, c.Weight, c.Hebb})
 		n.off[slot+1]++
-		deps[ti] = append(deps[ti], fi)
+		depAt[ti+1]++
+	}
+	for i := 1; i <= nc; i++ {
+		depAt[i] += depAt[i-1]
+	}
+	deps := make([]int32, len(edges))
+	depFill := append([]int32(nil), depAt[:nc]...)
+	for _, e := range edges {
+		t := e.slot / int(NumGates)
+		deps[depFill[t]] = int32(e.from)
+		depFill[t]++
 	}
 	for i := 1; i < len(n.off); i++ {
 		n.off[i] += n.off[i-1]
@@ -105,8 +117,8 @@ func (g *Genome) BuildNetwork() *Network {
 			return
 		}
 		inStack[node] = true
-		for _, d := range deps[node] {
-			visit(d)
+		for _, d := range deps[depAt[node]:depAt[node+1]] {
+			visit(int(d))
 		}
 		inStack[node] = false
 		visited[node] = true
@@ -237,4 +249,60 @@ func fastTanh32(x float32) float32 {
 	}
 	x2 := x * x
 	return x * (27 + x2) / (27 + 9*x2)
+}
+
+// idIndex maps node IDs to their index in a genome's node list. IDs are
+// global counters, a few times larger than the node count, so a dense table
+// borrowed from a pool is much cheaper than a map; a genome whose IDs are
+// too sparse for that falls back to a map.
+type idIndex struct {
+	dense *[]int32 // index+1 by ID, 0 when absent
+	ids   []NodeGene
+	m     map[int]int
+}
+
+var idTables = sync.Pool{New: func() any { return new([]int32) }}
+
+func newIDIndex(nodes []NodeGene) idIndex {
+	top, low := 0, 0
+	for _, nd := range nodes {
+		top, low = max(top, nd.ID), min(low, nd.ID)
+	}
+	if top >= 64*len(nodes)+1024 || low < 0 || nodes == nil {
+		m := make(map[int]int, len(nodes))
+		for i, nd := range nodes {
+			m[nd.ID] = i
+		}
+		return idIndex{m: m}
+	}
+	t := idTables.Get().(*[]int32)
+	if len(*t) <= top {
+		*t = make([]int32, top+1)
+	}
+	for i, nd := range nodes {
+		(*t)[nd.ID] = int32(i + 1)
+	}
+	return idIndex{dense: t, ids: nodes}
+}
+
+func (x idIndex) get(id int) (int, bool) {
+	if x.dense == nil {
+		i, ok := x.m[id]
+		return i, ok
+	}
+	if id < 0 || id >= len(*x.dense) || (*x.dense)[id] == 0 {
+		return 0, false
+	}
+	return int((*x.dense)[id]) - 1, true
+}
+
+// release clears the entries it set and returns the table to the pool.
+func (x idIndex) release() {
+	if x.dense == nil {
+		return
+	}
+	for _, nd := range x.ids {
+		(*x.dense)[nd.ID] = 0
+	}
+	idTables.Put(x.dense)
 }

@@ -2,6 +2,8 @@ package neat
 
 import (
 	"math/rand"
+	"slices"
+	"sort"
 	"testing"
 )
 
@@ -59,5 +61,25 @@ func TestFlatLevels(t *testing.T) {
 	}
 	if len(f.LevelStart) < 3 {
 		t.Fatalf("only %d levels: the test genome is too shallow", len(f.LevelStart)-1)
+	}
+}
+
+// Flat orders the nodes by level, keeping the network's order inside a
+// level, as a stable sort by level would.
+func TestFlatOrderIsStableByLevel(t *testing.T) {
+	for seed := int64(1); seed <= 5; seed++ {
+		net := bigGenome(seed, 67, 8).BuildNetwork()
+		f := net.Flat()
+		level := map[int32]int{}
+		for l := 0; l+1 < len(f.LevelStart); l++ {
+			for _, ni := range f.Order[f.LevelStart[l]:f.LevelStart[l+1]] {
+				level[ni] = l
+			}
+		}
+		want := append([]int32(nil), net.order...)
+		sort.SliceStable(want, func(a, b int) bool { return level[want[a]] < level[want[b]] })
+		if !slices.Equal(want, f.Order) || len(level) != len(net.order) {
+			t.Fatalf("seed %d: order %v, want %v", seed, f.Order, want)
+		}
 	}
 }
