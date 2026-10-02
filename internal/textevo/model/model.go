@@ -20,11 +20,9 @@ const (
 )
 
 // NewGenome returns a minimal genome mapping a dim embedding to a dim output,
-// with one heritable trait: the logit scale.
+// with one heritable trait: the logit scale. It has no state bank.
 func NewGenome(id, dim int) *neat.Genome {
-	g := neat.NewGenome(id, dim, dim)
-	g.Traits = neat.RandomTraits(1)
-	return g
+	return NewGenomeShape(id, Shape{dim, 0})
 }
 
 // Scale is the logit temperature s = 1 + 19*Traits[0], or its midpoint when

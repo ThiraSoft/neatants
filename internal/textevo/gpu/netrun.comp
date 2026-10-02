@@ -48,6 +48,14 @@ layout(push_constant) uniform Push {
 	uint listOff;
 } pc;
 
+#define MAX_BANKS 4u
+// DECAY is model.Decays.
+const float DECAY[MAX_BANKS] = float[MAX_BANKS](0.5, 0.875, 0.97, 0.992);
+
+// The state banks of model.Net live in v, in the values of their input
+// nodes: an input is written only by the tick that reads it, so a bank input
+// keeps its value from one tick to the next, which is all a bank needs. They
+// take no shared memory beyond the values the network already has.
 shared float v[MAX_VALUES];
 shared float cell[MAX_MEMORY];
 shared float pw[MAX_PLASTIC];
@@ -137,6 +145,9 @@ void main() {
 	uint start = gw[pc.startsOff + w];
 	uint scored = pc.len - pc.warm;
 	uint hd = pc.dim / 2u;
+	// The state banks are inputs after the embedding (see model.Shape), so
+	// the record says how many a network has.
+	uint banks = (inEnd - inStart) / pc.dim - 1u;
 
 	for (uint i = lane; i < n; i += LANES) v[i] = 0.0;
 	for (uint i = lane; i < MAX_MEMORY; i += LANES) cell[i] = 0.0;
@@ -145,13 +156,38 @@ void main() {
 
 	for (uint t = 0u; t < pc.len; t++) {
 		uint row = tokens[start + t] * pc.dim;
+		// The write rate of each bank, from the gate the network wrote at the
+		// tick before; nothing has written a gate before the first tick, which
+		// then has the default rate, as model.Net does.
+		float rate[MAX_BANKS];
+		for (uint b = 0u; b < MAX_BANKS; b++) {
+			float gt = 0.5;
+			if (t > 0u && b < banks) gt = v[outStart + pc.dim + b];
+			precise float r = (1.0 - DECAY[b]) * 2.0 * gt;
+			rate[b] = r;
+		}
 		// Bias and inputs, then the previous-tick copies, as Flat.Activate
-		// sets the inputs before it copies the values.
+		// sets the inputs before it copies the values. Only the bias and the
+		// inputs are written, so that the gates read above are never written
+		// while other lanes read them.
 		for (uint x = lane; x < n; x += LANES) {
 			float y = v[x];
-			if (x == 0u) y = 1.0;
-			else if (x >= inStart && x < inEnd) y = emb[row + (x - inStart)];
-			v[x] = y;
+			if (x == 0u) {
+				y = 1.0;
+				v[x] = y;
+			} else if (x >= inStart && x < inEnd) {
+				uint k = x - inStart;
+				if (k < pc.dim) {
+					y = emb[row + k];
+				} else {
+					// A bank input keeps its bank value from tick to tick
+					// and moves towards the embedding, as model.StepState.
+					k -= pc.dim;
+					precise float s = y + rate[k / pc.dim] * (emb[row + k % pc.dim] - y);
+					y = s;
+				}
+				v[x] = y;
+			}
 			uint back = gw[kindOff + x] >> 8;
 			if (back != 0u) v[n + back - 1u] = y;
 		}

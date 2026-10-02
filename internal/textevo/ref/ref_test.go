@@ -84,3 +84,40 @@ func TestZeroOutputIsUnigram(t *testing.T) {
 		t.Fatalf("zero genome %g bpb, unigram %g", got, want)
 	}
 }
+
+// A network whose only link reads the first value of bank 0 must see a token
+// of the past: a large first embedding value at tick 0 still moves its
+// output ticks later, where the same network over tokens whose first value
+// is zero stays at o = 0.
+func TestStateSeesThePast(t *testing.T) {
+	s := model.Shape{Dim: 8, Banks: 2}
+	g := model.NewGenomeShape(1, s)
+	// Node IDs as neat.NewGenome numbers them: bias 0, inputs 1..Inputs,
+	// outputs after.
+	g.Conns = []neat.ConnGene{{In: 1 + 8, Out: 1 + s.Inputs(), Weight: 5, Enabled: true, Innovation: 1}}
+	d := model.Synthetic(4, 8, 40, 6)
+	for j := range 4 {
+		d.E[j*8] = 0
+	}
+	d.E[1*8] = 4 // token 1 is the one to remember
+	for i := range d.Train {
+		d.Train[i] = 2
+	}
+	quiet := Rows(g, d, d.Train, 0, 12, 0)
+	d.Train[0] = 1
+	loud := Rows(g, d, d.Train, 0, 12, 0)
+	for tk := range 12 {
+		if quiet[tk][0] != 0 {
+			t.Fatalf("tick %d: o[0] = %g without the token, want 0", tk, quiet[tk][0])
+		}
+	}
+	for _, tk := range []int{0, 3, 6} {
+		if loud[tk][0] <= 0.01 {
+			t.Fatalf("tick %d: o[0] = %g, the bank forgot the token of tick 0", tk, loud[tk][0])
+		}
+		if len(loud[tk]) != 8 {
+			t.Fatalf("%d values a row, want the 8 predictions without the gates", len(loud[tk]))
+		}
+	}
+	t.Logf("o[0] after the token: %v", []float32{loud[0][0], loud[3][0], loud[6][0], loud[11][0]})
+}

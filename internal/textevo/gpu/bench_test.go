@@ -182,6 +182,13 @@ func TestRealisticSizes(t *testing.T) {
 // the inputs) on the prepared file of dimension dim, mutated a few times as
 // the children of the first generations are.
 func benchDense(b *testing.B, file string, dim int, mode string) {
+	benchDenseState(b, file, dim, 0, mode)
+}
+
+// benchDenseState is benchDense for networks with banks state banks; the
+// dense start reads dim of the dim*(1+banks) inputs, as neattext -links dim
+// -state banks does.
+func benchDenseState(b *testing.B, file string, dim, banks int, mode string) {
 	d, err := prep.Load("../../../data/" + file)
 	if err != nil {
 		b.Logf("no data/%s, synthetic data of the same size", file)
@@ -190,7 +197,7 @@ func benchDense(b *testing.B, file string, dim int, mode string) {
 	defer func(k int) { neat.MinimalLinks = k }(neat.MinimalLinks)
 	neat.MinimalLinks = dim
 	benchPopOn(b, d, 200, func(i, dim int) *neat.Genome {
-		g := model.NewGenome(i+1, dim)
+		g := model.NewGenomeShape(i+1, model.Shape{Dim: dim, Banks: banks})
 		for range 3 {
 			g.Mutate()
 		}
@@ -198,9 +205,11 @@ func benchDense(b *testing.B, file string, dim int, mode string) {
 	}, mode)
 }
 
-func BenchmarkDensePop200D128(b *testing.B) { benchDense(b, "prep.bin", 128, "") }
-func BenchmarkDensePop200D64(b *testing.B)  { benchDense(b, "prep64.bin", 64, "") }
-func BenchmarkDensePop200D32(b *testing.B)  { benchDense(b, "prep32.bin", 32, "") }
-func BenchmarkDenseNet200D128(b *testing.B) { benchDense(b, "prep.bin", 128, "net") }
-func BenchmarkDenseNet200D64(b *testing.B)  { benchDense(b, "prep64.bin", 64, "net") }
-func BenchmarkDenseNet200D32(b *testing.B)  { benchDense(b, "prep32.bin", 32, "net") }
+func BenchmarkDensePop200D128(b *testing.B)      { benchDense(b, "prep.bin", 128, "") }
+func BenchmarkDensePop200D64(b *testing.B)       { benchDense(b, "prep64.bin", 64, "") }
+func BenchmarkDensePop200D32(b *testing.B)       { benchDense(b, "prep32.bin", 32, "") }
+func BenchmarkDenseNet200D128(b *testing.B)      { benchDense(b, "prep.bin", 128, "net") }
+func BenchmarkDenseNet200D64(b *testing.B)       { benchDense(b, "prep64.bin", 64, "net") }
+func BenchmarkDenseNet200D32(b *testing.B)       { benchDense(b, "prep32.bin", 32, "net") }
+func BenchmarkDensePop200D32State4(b *testing.B) { benchDenseState(b, "prep32.bin", 32, 4, "") }
+func BenchmarkDenseNet200D32State4(b *testing.B) { benchDenseState(b, "prep32.bin", 32, 4, "net") }

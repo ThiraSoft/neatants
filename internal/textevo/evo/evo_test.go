@@ -5,6 +5,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/ThiraSoft/neatants/internal/textevo/model"
 	"github.com/ThiraSoft/neatants/neat"
 )
 
@@ -192,5 +193,22 @@ func TestParallelSpeciationMatchesSequential(t *testing.T) {
 			g.Evals = 0
 		}
 		p.Next(fit)
+	}
+}
+
+// Every genome of a population with state banks, children included, keeps
+// the shape of the first generation.
+func TestNewShapeKeepsTheShape(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Pop = 100
+	s := model.Shape{Dim: 8, Banks: 3}
+	p := NewShape(cfg, s)
+	for range 10 {
+		for _, g := range p.Genomes {
+			if got := model.ShapeOf(g, 8); got != s {
+				t.Fatalf("gen %d: genome %d has shape %+v", p.Gen, g.ID, got)
+			}
+		}
+		p.Next(scores(p, toy))
 	}
 }

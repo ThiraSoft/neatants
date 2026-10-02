@@ -69,12 +69,13 @@ func draw(x []float64, temp float64, rng *rand.Rand) int32 {
 // sample runs the champion on the CPU: it reads the prompt, then draws each
 // next token from its softmax at temperature temp.
 func sample(g *neat.Genome, d *prep.Data, prompt []int32, n int, temp float64, rng *rand.Rand) []int32 {
-	f := g.BuildNetwork().Flat()
-	st := f.NewState()
+	// model.Net carries the state banks of the champion, if it has any, the
+	// way the evaluation ran it.
+	net := model.NewNet(g, d.Dim)
 	scale := model.LogitScale(g, d.Dim)
 	o := make([]float32, d.Dim)
 	read := func(id int32) {
-		for j, v := range f.Activate(st, d.Row(id)) {
+		for j, v := range net.Step(d.Row(id)) {
 			o[j] = 2*v - 1
 		}
 	}

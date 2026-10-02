@@ -16,6 +16,10 @@ import (
 // needed (799 values, 197 memory cells, 187 plastic links), which takes
 // about a third of the shared memory of a big one, and the big one for the
 // networks that outgrow it. The Max constants are those of the big one.
+//
+// The state banks of model.Net take no room of their own: they live in the
+// values of their input nodes, which count in MaxValues like any node, so a
+// network with B banks has B*D values fewer for its hidden nodes.
 const (
 	MaxValues  = 2048
 	MaxNodes   = MaxValues

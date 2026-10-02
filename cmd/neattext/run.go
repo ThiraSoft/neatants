@@ -57,6 +57,9 @@ func runEvolve() {
 	if *wmut <= 0 {
 		fail(2, "-wmut must be positive")
 	}
+	if *banks < 0 || *banks > model.MaxBanks {
+		fail(2, "-state must be between 0 and %d", model.MaxBanks)
+	}
 	// The dimension is the prepared file's: -dim only tells -prep what to
 	// write, so a run never has to repeat it.
 	d := load()
@@ -95,7 +98,7 @@ func runEvolve() {
 	w.Write(header)
 	fmt.Println(strings.Join(header, ","))
 
-	fmt.Printf("data %s, dim %d, links %d, wmut %g, pop %d\n", *dataPath, d.Dim, *links, *wmut, *pop)
+	fmt.Printf("data %s, dim %d, links %d, wmut %g, state %d, pop %d\n", *dataPath, d.Dim, *links, *wmut, *banks, *pop)
 	printBaselines(d)
 
 	// Ctrl+C lets the generation in flight finish, then validates and saves.
@@ -109,7 +112,9 @@ func runEvolve() {
 	neat.WeightsPerMutation = *wmut
 	cfg := evo.DefaultConfig()
 	cfg.Pop = *pop
-	p := evo.New(cfg, d.Dim)
+	// -links counts the bank inputs like the embedding ones: a fresh output
+	// reads that many of all Dim*(1+banks) inputs, drawn at random.
+	p := evo.NewShape(cfg, model.Shape{Dim: d.Dim, Banks: *banks})
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	sum := prep.Checksum(d)
 	bestVal := math.Inf(1)
@@ -158,7 +163,7 @@ func runEvolve() {
 			val = num(v)
 			if v < bestVal {
 				bestVal = v
-				if err := save(dir, champion{champ, d.Dim, sum, v, gen}); err != nil {
+				if err := save(dir, champion{champ, d.Dim, *banks, sum, v, gen}); err != nil {
 					fail(1, "%v", err)
 				}
 			}

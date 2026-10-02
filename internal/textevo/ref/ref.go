@@ -13,13 +13,14 @@ import (
 )
 
 // Rows runs a fresh network of g over the window starting at start and
-// returns its output vector o = 2v-1 for each scored tick t >= warm.
+// returns its output vector o = 2v-1 for each scored tick t >= warm. A genome
+// with state banks (see model.Net) carries them through the window, and its
+// gate outputs are not part of o.
 func Rows(g *neat.Genome, d *prep.Data, ids []int32, start, length, warm int) [][]float32 {
-	f := g.BuildNetwork().Flat()
-	st := f.NewState()
+	net := model.NewNet(g, d.Dim)
 	rows := make([][]float32, 0, length-warm)
 	for t := range length {
-		out := f.Activate(st, d.Row(ids[start+t]))
+		out := net.Step(d.Row(ids[start+t]))
 		if t < warm {
 			continue
 		}

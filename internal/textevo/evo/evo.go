@@ -61,11 +61,18 @@ type Population struct {
 	best     *neat.Genome
 }
 
-// New creates a random first generation of genomes for dim-wide vectors.
+// New creates a random first generation of genomes for dim-wide vectors,
+// without state banks.
 func New(cfg Config, dim int) *Population {
-	p := &Population{cfg: cfg, dim: dim, nextID: cfg.Pop + 1, Threshold: 2.0}
+	return NewShape(cfg, model.Shape{Dim: dim})
+}
+
+// NewShape creates a random first generation of genomes of shape s. Children
+// inherit the shape of their parents, so the whole run keeps it.
+func NewShape(cfg Config, s model.Shape) *Population {
+	p := &Population{cfg: cfg, dim: s.Dim, nextID: cfg.Pop + 1, Threshold: 2.0}
 	for i := 0; i < cfg.Pop; i++ {
-		p.Genomes = append(p.Genomes, model.NewGenome(i+1, dim))
+		p.Genomes = append(p.Genomes, model.NewGenomeShape(i+1, s))
 	}
 	return p
 }

@@ -49,6 +49,31 @@ func TestSampleLength(t *testing.T) {
 	}
 }
 
+// A champion with state banks samples with them: the same draws as a loop
+// over model.Net, which is what the evaluation scored.
+func TestSampleWithState(t *testing.T) {
+	d := model.Synthetic(10, 8, 50, 1)
+	g := model.GrownShape(1, model.Shape{Dim: 8, Banks: 2}, 50)
+	got := sample(g, d, []int32{1, 2}, 30, 1, rand.New(rand.NewSource(1)))
+	rng := rand.New(rand.NewSource(1))
+	net := model.NewNet(g, 8)
+	o := make([]float32, 8)
+	read := func(id int32) {
+		for j, v := range net.Step(d.Row(id)) {
+			o[j] = 2*v - 1
+		}
+	}
+	read(1)
+	read(2)
+	for i := range 30 {
+		id := draw(logits(d, o, model.LogitScale(g, 8)), 1, rng)
+		if got[i] != id {
+			t.Fatalf("token %d: sampled %d, want %d", i, got[i], id)
+		}
+		read(id)
+	}
+}
+
 // The sampler scores tokens as the evaluation does: with o = 0 its logits are
 // the unigram prior.
 func TestLogitsStartFromThePrior(t *testing.T) {

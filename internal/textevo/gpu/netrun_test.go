@@ -267,3 +267,39 @@ func TestNetrunDenseStart(t *testing.T) {
 		t.Fatalf("worst difference %g", worst)
 	}
 }
+
+// Networks with state banks: the kernel keeps the banks and the gates across
+// the window, and the rows are the D predictions only.
+func TestNetrunStateMatchesCPU(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 32, 2000, 21)
+	var gs []*neat.Genome
+	for i := range 20 {
+		s := model.Shape{Dim: 32, Banks: 2}
+		if i%4 == 3 {
+			s.Banks = 4
+		}
+		gs = append(gs, model.GrownShape(int64(i), s, 50*i))
+	}
+	starts := []int{0, 500, 1300}
+	const L, W = 64, 16
+	rows, err := runNetrun(dev, d, gs, starts, L, W)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worst := 0.0
+	for gi, g := range gs {
+		for wi, s := range starts {
+			want := ref.Rows(g, d, d.Train, s, L, W)
+			for ti := range want {
+				for j := range want[ti] {
+					worst = math.Max(worst, math.Abs(float64(rows[gi][wi][ti][j]-want[ti][j])))
+				}
+			}
+		}
+	}
+	t.Logf("worst difference %g", worst)
+	if worst > 2e-3 {
+		t.Fatalf("worst difference %g", worst)
+	}
+}

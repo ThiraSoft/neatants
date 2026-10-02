@@ -38,7 +38,12 @@ func Synthetic(vocab, dim, tokens int, seed int64) *prep.Data {
 // Hebbian plasticity on three links. The global rand source is unseeded, so
 // the structure varies from run to run; tests must not depend on it.
 func Grown(seed int64, dim, mutations int) *neat.Genome {
-	g := NewGenome(int(seed), dim)
+	return GrownShape(seed, Shape{dim, 0}, mutations)
+}
+
+// GrownShape is Grown for a genome of shape s.
+func GrownShape(seed int64, s Shape, mutations int) *neat.Genome {
+	g := NewGenomeShape(int(seed), s)
 	for range mutations {
 		g.Mutate()
 	}

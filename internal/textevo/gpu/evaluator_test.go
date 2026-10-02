@@ -1,7 +1,9 @@
 package gpu
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/ThiraSoft/neatants/internal/textevo/model"
@@ -223,4 +225,51 @@ func TestEvaluatorZeroIsUnigram(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestEvaluatorStateMatchesCPU(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 32, 3000, 23)
+	var gs []*neat.Genome
+	for i := range 30 {
+		gs = append(gs, model.GrownShape(int64(i), model.Shape{Dim: 32, Banks: 2}, 40*i))
+	}
+	e, err := New(dev, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	starts := []int{3, 900, 2000, 2500}
+	got, over, err := e.Evaluate(gs, starts, 80, 16)
+	if err != nil || over != 0 {
+		t.Fatal(err, over)
+	}
+	want := ref.Evaluate(gs, d, d.Train, starts, 80, 16)
+	worst := 0.0
+	for i := range gs {
+		worst = math.Max(worst, math.Abs(got[i]-want[i])/want[i])
+		if math.Abs(got[i]-want[i]) > 2e-3*want[i] {
+			t.Fatalf("genome %d: gpu %g cpu %g", i, got[i], want[i])
+		}
+	}
+	t.Logf("worst relative difference %g", worst)
+}
+
+// A genome whose inputs and outputs are not those of a network for the
+// data's dimension cannot be scored: the evaluator says so instead of reading
+// past the embedding row.
+func TestEvaluatorRejectsWrongShape(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 32, 3000, 25)
+	e, err := New(dev, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	defer func() {
+		if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), "state banks") {
+			t.Fatalf("recovered %v, want the shape panic", r)
+		}
+	}()
+	e.Evaluate([]*neat.Genome{model.NewGenome(1, 16)}, []int{0}, 64, 16)
 }

@@ -5,6 +5,7 @@
 //	./neattext -prep                 # tokenize the corpus once
 //	./neattext -baselines            # n-gram reference scores
 //	./neattext -pop 200 -gens 12     # evolve, on the GPU
+//	./neattext -state 4              # evolve networks that read four state banks
 //	./neattext -sample runs/<dir>/champion.json
 //
 // -data picks the prepared file in every mode, so several dimensions can sit
@@ -44,6 +45,7 @@ var (
 	hebb      = flag.Float64("hebb", neat.HebbRate, "rate at which a mutation makes a link plastic")
 	links     = flag.Int("links", neat.MinimalLinks, "inputs each output reads in a first-generation genome (the dim for a dense map)")
 	wmut      = flag.Float64("wmut", neat.WeightsPerMutation, "weights a mutation perturbs on average")
+	banks     = flag.Int("state", 0, "state banks every network reads, 0 to 4: running averages of the embeddings at four time scales, written through gates")
 	cpu       = flag.Bool("cpu", false, "evaluate on the CPU reference instead of the GPU")
 	out       = flag.String("out", "", "run directory (default runs/<date-time>)")
 	n         = flag.Int("n", 200, "tokens to sample")
@@ -55,6 +57,7 @@ var (
 type champion struct {
 	Genome   *neat.Genome `json:"genome"`
 	Dim      int          `json:"dim"`
+	Banks    int          `json:"banks"`
 	Checksum uint64       `json:"checksum"`
 	ValBPB   float64      `json:"val_bpb"`
 	Gen      int          `json:"gen"`
@@ -150,6 +153,12 @@ func runSample() {
 	if c.Dim != d.Dim || c.Checksum != prep.Checksum(d) {
 		fail(1, "%s was evolved on another corpus preparation (dim %d, checksum %016x; %s has dim %d, checksum %016x)",
 			*sampleOf, c.Dim, c.Checksum, *dataPath, d.Dim, prep.Checksum(d))
+	}
+	// The genome's inputs say how many banks it reads; a champion that
+	// disagrees with its own record was not written by this program.
+	in, out := c.Genome.NumInputs, c.Genome.NumOutputs
+	if s := (model.Shape{Dim: c.Dim, Banks: c.Banks}); c.Banks < 0 || c.Banks > model.MaxBanks || in != s.Inputs() || out != s.Outputs() {
+		fail(1, "%s: a genome of %d inputs and %d outputs is not a network of dim %d with %d state banks", *sampleOf, in, out, c.Dim, c.Banks)
 	}
 	g, voc := openModel()
 	defer g.Close()

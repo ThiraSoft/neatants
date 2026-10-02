@@ -238,6 +238,12 @@ func (e *Evaluator) Validate(g *neat.Genome) (float64, error) {
 func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []int, length, warm int) ([]float64, int, error) {
 	d := e.data
 	start := time.Now()
+	// The kernel finds the banks of a network from its inputs, so a genome
+	// of another shape would read past the embedding row: it is a
+	// programming error, caught here rather than in the packing goroutines.
+	for _, g := range gs {
+		model.ShapeOf(g, d.Dim)
+	}
 	slots := e.pack(gs, kind == 0)
 	bpb := make([]float64, len(gs))
 	var recs [][]uint32
