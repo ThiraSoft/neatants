@@ -1,0 +1,84 @@
+# === Colonies ===
+colonies: 4 # number of rival colonies
+start_ants: 28 # ants per colony at the start
+max_ants_per_nest: 100
+ant_cost: 5 # food needed to hatch one ant
+egg_max: 20 # eggs the queen can keep in stock
+egg_reserve: 6 # eggs kept for hard times (they hatch when fewer than 8 ants are left or food runs out)
+queen_egg_every: 1200 # even when broke, the queen lays one free egg every ~this many ticks
+start_food: 40
+ant_speed: 1.6
+ant_vision: 110
+ant_max_age: 36000 # maximum lifespan of an ant in ticks (drawn between half of this and the maximum)
+ant_energy_drain: 0.00012
+ant_hidden: 0 # hidden neurons of new genomes · 0 = minimal NEAT start (inputs wired straight to outputs, structure comes from mutations)
+think_every: 2 # ants think one tick out of N (2 = 30 times per second, 1 = every tick)
+threat_range: 130 # distance at which an ant spots the nearest threat (shorter = cheaper to compute)
+selection: colony # colony: half colony success, half individual contribution · advanced: individual contribution only · classic: former selection
+shaping_fade: 1000000 # evolution ticks to fade out the learning rewards (pickup, travel, fights...): afterwards only the colony, deliveries and survival count · 0 = never
+shaping_floor: 0.3 # share of the learning rewards kept once the fade is over: without them nothing guides ants to food any more and foraging is lost
+brain_mode: full # hybrid: instinct + brain · full: the brain drives alone (no more instinct or steering roles, no shopping on foot)
+aim_assist: 20            # full mode: half-angle (degrees) of the aim-assist cone for Fire and Lightning (0 = pure aim)
+instinct_min: 0.25 # instinct of new genomes: lower bound
+instinct_max: 0.35 # instinct cap for every birth (and upper bound of new genomes)
+instinct_weight: 0.65 # maximum share of instinct against the neural network (0 = brain only, 1 = pure instinct)
+nest_max_hp: 400
+refound_delay: 1800 # ticks before a queen refounds a destroyed colony
+refound_from: own # lineage of a refounded colony: own (its own), best (the best one), fresh (a new one)
+hall_of_fame_size: 20
+survivor_pool_size: 40
+mana_regen: 0.0017
+
+# === Food ===
+food_bushes: 14
+food_spawn_every: 160
+food_max_items: 650
+food_gap_adaptive: true # the food-free zone around nests starts at 84 px and widens to 250 px while few ants starve (false = 250 px right away)
+
+# === Pheromones ===
+phero_decay: 0.996
+
+# === Monsters (cave) ===
+first_wave: 2400
+wave_interval: 4200
+wave_base: 12
+wave_min: 6 # minimum monsters per wave, even when the threat is at its floor
+wave_growth: 2.5
+wave_hp_growth: 0.0 # extra monster hit points per wave (0.14 = +14 %)
+wave_per_ant: 0.3 # cap of monsters per living ant (0 = no cap, waves grow without end)
+monster_hp_mult: 1.0 # multiplies the hit points of every monster
+adaptive_waves: true # the threat sets the size and strength of waves to keep the balance (replaces wave_growth and the damage increase at each wave)
+threat_signal: deaths # deaths: the threat rises while monsters cause fewer than threat_deaths of ant deaths (fleeing no longer weakens them) · kills: former rule, share of monsters killed aimed at by wave_balance
+threat_deaths: 0.25 # share of ant deaths caused by monsters that the threat aims at (deaths mode)
+threat_age: 0.25 # deaths mode: weight of the rise when monsters die of old age without having been killed (they were never fought)
+wave_balance: 0.5 # kills mode: share of monsters ants must kill for the threat to stay stable (higher = easier monsters)
+monster_brains: true # monsters have a NEAT brain that evolves against the ants (co-evolution)
+boss_every: 5
+monster_max_age: 12000 # a monster dies of old age after ~this many ticks (±20 %, x2 for bosses)
+monster_disease: true # cave fever: contagious disease of old monsters
+disease_onset: 0.3 # share of lifespan from which a monster can fall ill
+disease_contagion: 0.25 # chance to infect each neighbour, twice per second
+disease_damage: 0.03 # share of max HP lost every second by a sick monster
+
+# === Wallmart ===
+shop_enabled: true
+insecticide_price: 20 # food spent for one pack
+insecticide_pack: 3 # bombs per pack
+insecticide_charges: 3 # sprays per bomb
+delivery_fee: 12 # extra charge for scooter delivery
+black_friday: true # once a day, -70 % sales and a brawl in the parking lot
+
+# === Absurdities ===
+weird_weather: true # frog rain, confetti storm
+queen_live: true # queens livestream from the nest
+
+# === Marriages ===
+marriage: true # two neighbouring colonies at peace can unite
+marriage_delay: 8000 # ticks without any aggression before a marriage becomes possible
+divorce_grief: 3 # wounds inflicted on the spouse before the divorce
+cave_moves_each_wave: true # the cave moves to a new place at every wave
+
+# === Misc ===
+save_every: 6000
+day_length_seconds: 300
+weather_rain: true

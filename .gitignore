@@ -1,0 +1,5 @@
+/neatants
+/neatants-headless
+*.tar.gz
+*.log
+/saves/
