@@ -159,3 +159,34 @@ func TestEvaluatorReusesChampionRecords(t *testing.T) {
 		}
 	}
 }
+
+// A copy that keeps its Origin but whose genes changed without Mutate (same
+// node and connection counts) must not reuse the record of its origin.
+func TestEvaluatorCacheIgnoresChangedCopy(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 32, 3000, 17)
+	g := model.Grown(5, 32, 60)
+	g.ID = 1
+	e, err := New(dev, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	starts := []int{3, 900, 2000}
+	if _, _, err := e.Evaluate([]*neat.Genome{g}, starts, 80, 16); err != nil {
+		t.Fatal(err)
+	}
+	c := g.Copy()
+	c.Origin, c.ID = g.Lineage(), 2
+	for i := range c.Conns {
+		c.Conns[i].Weight = -c.Conns[i].Weight
+	}
+	got, _, err := e.Evaluate([]*neat.Genome{c}, starts, 80, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ref.Evaluate([]*neat.Genome{c}, d, d.Train, starts, 80, 16)
+	if math.Abs(got[0]-want[0]) > 2e-3*want[0] {
+		t.Fatalf("changed copy: gpu %g cpu %g (stale record reused)", got[0], want[0])
+	}
+}

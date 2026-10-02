@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"time"
 	"unsafe"
 
@@ -308,16 +309,27 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 }
 
 // packed is the record of one genome, ready for the upload, or the fact that
-// it does not fit the kernel.
+// it does not fit the kernel, with a copy of the genes it was built from.
 type packed struct {
-	rec          []uint32
-	fits         bool
-	nodes, conns int
+	rec     []uint32
+	fits    bool
+	nodes   []neat.NodeGene
+	conns   []neat.ConnGene
+	inputs  int
+	outputs int
+}
+
+// same reports whether g has exactly the genes p was built from. Origin only
+// says what a genome was copied from: a caller may change the genes of a copy
+// without Mutate, and a stale record would then score another network.
+func (p *packed) same(g *neat.Genome) bool {
+	return p.inputs == g.NumInputs && p.outputs == g.NumOutputs &&
+		slices.Equal(p.nodes, g.Nodes) && slices.Equal(p.conns, g.Conns)
 }
 
 // pack builds the record of every genome. With cache set, an unchanged copy
-// of a genome of the previous generation (a champion carried over) reuses that
-// genome's record; the slots alternate between two sets so that the records
+// of a genome of the previous generation (a champion carried over, found by
+// Origin and checked gene by gene) reuses that genome's record; the slots alternate between two sets so that the records
 // a copy reads are never the ones being rewritten, and their buffers are
 // reused from one generation to the next instead of being allocated again.
 func (e *Evaluator) pack(gs []*neat.Genome, cache bool) []packed {
@@ -334,8 +346,11 @@ func (e *Evaluator) pack(gs []*neat.Genome, cache bool) []packed {
 	}
 	parallel(len(gs), func(i int) {
 		g, s := gs[i], &slots[i]
-		s.nodes, s.conns = len(g.Nodes), len(g.Conns)
-		if p := prev[g.Origin]; g.Origin > 0 && p != nil && p.nodes == s.nodes && p.conns == s.conns {
+		if cache {
+			s.nodes, s.conns = append(s.nodes[:0], g.Nodes...), append(s.conns[:0], g.Conns...)
+			s.inputs, s.outputs = g.NumInputs, g.NumOutputs
+		}
+		if p := prev[g.Origin]; g.Origin > 0 && p != nil && p.same(g) {
 			s.fits, s.rec = p.fits, append(s.rec[:0], p.rec...)
 			return
 		}
