@@ -190,3 +190,25 @@ func TestWeightMutationCount(t *testing.T) {
 		}
 	}
 }
+
+// A weight mutation rate of zero or less does nothing and does not panic.
+func TestWeightMutationNoRate(t *testing.T) {
+	defer func(w float64) { WeightsPerMutation = w }(WeightsPerMutation)
+	for _, w := range []float64{0, -1} {
+		WeightsPerMutation = w
+		g := NewGenome(1, 4, 4)
+		for len(g.Conns) < 20 {
+			g.Conns = append(g.Conns, ConnGene{Innovation: len(g.Conns) + 1, Weight: 0.5})
+		}
+		for i := range g.Conns {
+			g.Conns[i].Weight = 0.5
+		}
+		g.mutateWeightsAdaptive()
+		for _, c := range g.Conns {
+			if c.Weight != 0.5 {
+				t.Fatalf("WeightsPerMutation %g changed a weight", w)
+			}
+		}
+		g.Mutate()
+	}
+}

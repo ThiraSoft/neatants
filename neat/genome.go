@@ -542,6 +542,11 @@ func (g *Genome) mutateWeightsAdaptive() {
 		return
 	}
 	rate := math.Min(1, WeightsPerMutation/float64(len(g.Conns)))
+	// A rate of zero or less perturbs nothing, and it must return before the
+	// geometric law below, whose logarithm of 1-rate is zero or undefined.
+	if rate <= 0 {
+		return
+	}
 	// Each connection is perturbed with probability rate. Rather than one
 	// draw per connection, the gap to the next perturbed one is drawn from
 	// the geometric law of that test, which is the same choice in a few draws
@@ -616,6 +621,8 @@ func (g *Genome) addNodeMutation() {
 func Crossover(better, other *Genome, childID int) *Genome {
 	child := better.Copy()
 	child.ID = childID
+	// If better holds the same innovation twice, only the first copy can take
+	// the other parent's gene. That is rare and harmless.
 	if better.MutPower > 0 && other.MutPower > 0 {
 		child.MutPower = math.Sqrt(better.MutPower * other.MutPower)
 	}
@@ -781,9 +788,9 @@ func (g *Genome) sortedConns() []innWeight {
 	// innovation above the index, which is several times faster than a
 	// sort with a comparison function; the order is the same.
 	keys := make([]uint64, len(g.Conns))
-	small := len(g.Conns) < 1<<32
+	small := uint64(len(g.Conns)) < 1<<32
 	for i, x := range g.Conns {
-		if x.Innovation < 0 || x.Innovation >= 1<<31 {
+		if x.Innovation < 0 || int64(x.Innovation) >= 1<<31 {
 			small = false
 			break
 		}
