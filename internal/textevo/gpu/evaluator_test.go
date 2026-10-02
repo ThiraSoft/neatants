@@ -107,3 +107,55 @@ func TestValidateMatchesCPU(t *testing.T) {
 		t.Fatalf("gpu %g cpu %g", got, want)
 	}
 }
+
+// An unchanged copy of a genome of the previous generation reuses its record,
+// and the scores must be the ones a fresh evaluator gives.
+func TestEvaluatorReusesChampionRecords(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 128, 3000, 13)
+	var gs []*neat.Genome
+	for i := range 12 {
+		g := model.Grown(int64(i+1), 128, 20*i)
+		g.ID = i + 1
+		gs = append(gs, g)
+	}
+	e, err := New(dev, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	starts := []int{3, 900, 2000, 2500}
+	if _, _, err := e.Evaluate(gs, starts, 80, 16); err != nil {
+		t.Fatal(err)
+	}
+	// The next generation: copies of three genomes, one genome mutated, new ones.
+	next := []*neat.Genome{model.Grown(100, 128, 30)}
+	next[0].ID = 100
+	for _, i := range []int{2, 5, 9} {
+		c := gs[i].Copy()
+		c.Origin, c.ID = gs[i].Lineage(), 200+i
+		next = append(next, c)
+	}
+	m := gs[7].Copy()
+	m.ID = 300
+	m.Mutate()
+	next = append(next, m)
+	got, _, err := e.Evaluate(next, starts, 80, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := New(dev, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	want, _, err := fresh.Evaluate(next, starts, 80, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range next {
+		if got[i] != want[i] {
+			t.Fatalf("genome %d: with reuse %g, without %g", i, got[i], want[i])
+		}
+	}
+}

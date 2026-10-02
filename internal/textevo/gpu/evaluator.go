@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"runtime"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -46,6 +44,12 @@ type Evaluator struct {
 	skipNet, skipXent bool
 	// coop says that xent runs on the matrix cores.
 	coop bool
+
+	// slots are the records of the last two generations, flip says which set
+	// the last one used, and prev finds its records by lineage.
+	slots [2][]packed
+	flip  int
+	prev  map[int]*packed
 	// xentRows is how many rows one workgroup of xent covers.
 	xentRows int
 }
@@ -218,65 +222,48 @@ func (e *Evaluator) Validate(g *neat.Genome) (float64, error) {
 func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []int, length, warm int) ([]float64, int, error) {
 	d := e.data
 	start := time.Now()
-	flats := make([]*neat.Flat, len(gs))
-	var wg sync.WaitGroup
-	next := make(chan int)
-	for range min(runtime.NumCPU(), max(len(gs), 1)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range next {
-				if f := gs[i].BuildNetwork().Flat(); Fits(f) {
-					flats[i] = f
-				}
-			}
-		}()
-	}
-	for i := range gs {
-		next <- i
-	}
-	close(next)
-	wg.Wait()
+	slots := e.pack(gs, kind == 0)
 	bpb := make([]float64, len(gs))
-	var fit []*neat.Flat
+	var recs [][]uint32
 	var fitIdx []int
 	var scales []float32
 	over := 0
-	for i, f := range flats {
-		if f == nil {
+	for i := range slots {
+		if !slots[i].fits {
 			bpb[i] = math.Inf(1)
 			over++
 			continue
 		}
-		fit = append(fit, f)
+		recs = append(recs, slots[i].rec)
 		fitIdx = append(fitIdx, i)
 		scales = append(scales, model.LogitScale(gs[i], d.Dim))
 	}
-	if len(fit) == 0 {
+	if len(recs) == 0 {
 		e.Timing.Pack, e.Timing.GPU, e.Timing.Sum = time.Since(start), 0, 0
 		return bpb, over, nil
 	}
-	gen := buildGen(fit, scales, starts)
-	e.Timing.Pack = time.Since(start)
 
 	scored := length - warm
-	pairs := len(fit) * len(starts)
+	pairs := len(recs) * len(starts)
 	rows := pairs * scored
 	if pairs > maxGroups {
 		return nil, 0, fmt.Errorf("gpu: %d genomes x %d windows is %d pairs, over the %d workgroups of one dispatch: lower -pop or -windows",
-			len(fit), len(starts), pairs, maxGroups)
+			len(recs), len(starts), pairs, maxGroups)
 	}
 	if (rows+e.xentRows-1)/e.xentRows > maxGroups {
 		return nil, 0, fmt.Errorf("gpu: %d rows to score, over what one dispatch of xent covers (%d): lower -pop, -windows or -len",
 			rows, e.xentRows*maxGroups)
 	}
 
-	start = time.Now()
-	genBytes := 4 * len(gen.words)
+	genBytes := 4 * layoutSize(recs, len(starts))
 	if err := e.grow(genBytes, genBytes, rows*d.Dim*2, rows*4); err != nil {
 		return nil, 0, err
 	}
-	copy(e.up.Bytes(), words(gen.words))
+	// The records go straight into the staging buffer.
+	up := unsafe.Slice((*uint32)(unsafe.Pointer(&e.up.Bytes()[0])), genBytes/4)
+	gen := layoutInto(up, recs, scales, starts)
+	e.Timing.Pack = time.Since(start)
+	start = time.Now()
 	netPush := [7]uint32{uint32(pairs), uint32(len(starts)), uint32(length), uint32(warm), uint32(d.Dim),
 		uint32(gen.startsOff), uint32(gen.goffOff)}
 	xp := xentPush{uint32(rows), uint32(d.Vocab()), uint32(d.Dim), uint32(scored), uint32(len(starts)), uint32(warm),
@@ -310,4 +297,52 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 	}
 	e.Timing.Sum = time.Since(start)
 	return bpb, over, nil
+}
+
+// packed is the record of one genome, ready for the upload, or the fact that
+// it does not fit the kernel.
+type packed struct {
+	rec          []uint32
+	fits         bool
+	nodes, conns int
+}
+
+// pack builds the record of every genome. With cache set, an unchanged copy
+// of a genome of the previous generation (a champion carried over) reuses that
+// genome's record; the slots alternate between two sets so that the records
+// a copy reads are never the ones being rewritten, and their buffers are
+// reused from one generation to the next instead of being allocated again.
+func (e *Evaluator) pack(gs []*neat.Genome, cache bool) []packed {
+	var slots []packed
+	var prev map[int]*packed
+	if cache {
+		e.flip ^= 1
+		if len(e.slots[e.flip]) < len(gs) {
+			e.slots[e.flip] = append(e.slots[e.flip], make([]packed, len(gs)-len(e.slots[e.flip]))...)
+		}
+		slots, prev = e.slots[e.flip][:len(gs)], e.prev
+	} else {
+		slots = make([]packed, len(gs))
+	}
+	parallel(len(gs), func(i int) {
+		g, s := gs[i], &slots[i]
+		s.nodes, s.conns = len(g.Nodes), len(g.Conns)
+		if p := prev[g.Origin]; g.Origin > 0 && p != nil && p.nodes == s.nodes && p.conns == s.conns {
+			s.fits, s.rec = p.fits, append(s.rec[:0], p.rec...)
+			return
+		}
+		f := g.BuildNetwork().Flat()
+		if s.fits = Fits(f); s.fits {
+			s.rec = Pack(s.rec[:0], f)
+		} else {
+			s.rec = s.rec[:0]
+		}
+	})
+	if cache {
+		e.prev = make(map[int]*packed, len(gs))
+		for i, g := range gs {
+			e.prev[g.Lineage()] = &slots[i]
+		}
+	}
+	return slots
 }

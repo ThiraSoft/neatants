@@ -4,6 +4,7 @@ package gpu
 import (
 	_ "embed"
 	"math"
+	"slices"
 
 	"github.com/ThiraSoft/neatants/neat"
 )
@@ -60,32 +61,46 @@ func backCopies(f *neat.Flat) (at []uint32, count int) {
 func Pack(dst []uint32, f *neat.Flat) []uint32 {
 	n := f.Nodes()
 	back, _ := backCopies(f)
-	dst = append(dst, uint32(n), uint32(len(f.Order)), uint32(len(f.LevelStart)-1), uint32(len(f.Plastic)),
-		uint32(f.InStart), uint32(f.InEnd), uint32(f.OutStart), uint32(f.OutEnd))
-	for i, k := range f.Kind {
-		dst = append(dst, uint32(k)|back[i]<<8)
+	size := 8 + n + len(f.LevelStart) + len(f.Order) + len(f.Off) + 2*len(f.From) + 4*len(f.Plastic)
+	// Grow once, then fill by index: appending word by word costs more than
+	// the rest of the record.
+	at := len(dst)
+	dst = slices.Grow(dst, size)[:at+size]
+	w := dst[at:]
+	w[0], w[1], w[2], w[3] = uint32(n), uint32(len(f.Order)), uint32(len(f.LevelStart)-1), uint32(len(f.Plastic))
+	w[4], w[5], w[6], w[7] = uint32(f.InStart), uint32(f.InEnd), uint32(f.OutStart), uint32(f.OutEnd)
+	i := 8
+	for j, k := range f.Kind {
+		w[i+j] = uint32(k) | back[j]<<8
 	}
-	for _, x := range f.LevelStart {
-		dst = append(dst, uint32(x))
+	i += n
+	for j, x := range f.LevelStart {
+		w[i+j] = uint32(x)
 	}
-	for _, x := range f.Order {
-		dst = append(dst, uint32(x))
+	i += len(f.LevelStart)
+	for j, x := range f.Order {
+		w[i+j] = uint32(x)
 	}
-	for _, x := range f.Off {
-		dst = append(dst, uint32(x))
+	i += len(f.Order)
+	for j, x := range f.Off {
+		w[i+j] = uint32(x)
 	}
-	edges := len(dst)
-	for i, x := range f.From {
+	i += len(f.Off)
+	edges := i
+	for j, x := range f.From {
 		if int(x) >= n { // a back edge reads the copy, which sits after the n values
 			x = int32(n) + int32(back[int(x)-n]) - 1
 		}
-		dst = append(dst, uint32(x), math.Float32bits(f.Weight[i]))
+		w[i+2*j] = uint32(x)
+		w[i+2*j+1] = math.Float32bits(f.Weight[j])
 	}
+	i += 2 * len(f.From)
 	for p, pl := range f.Plastic {
-		dst[edges+2*int(pl.K)] |= uint32(p+1) << 16
+		w[edges+2*int(pl.K)] |= uint32(p+1) << 16
 	}
 	for _, p := range f.Plastic {
-		dst = append(dst, uint32(p.K), uint32(p.From), uint32(p.To), math.Float32bits(p.Eta))
+		w[i], w[i+1], w[i+2], w[i+3] = uint32(p.K), uint32(p.From), uint32(p.To), math.Float32bits(p.Eta)
+		i += 4
 	}
 	return dst
 }
