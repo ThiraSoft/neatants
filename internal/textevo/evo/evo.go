@@ -159,11 +159,15 @@ func (p *Population) speciate() {
 		alive = append(alive, sp)
 	}
 	p.Species = alive
+	// Relatives in a converged population differ by a few hundredths (one
+	// disjoint gene in two thousand is 5e-4), so the threshold may go that
+	// low, and it moves by a fifth a generation so that it gets there from
+	// its start at 2.0 in about twenty generations rather than a hundred.
 	switch {
 	case len(p.Species) < p.cfg.MinSpecies:
-		p.Threshold = math.Max(0.3, p.Threshold*0.97)
+		p.Threshold = math.Max(1e-4, p.Threshold*0.8)
 	case len(p.Species) > p.cfg.MaxSpecies:
-		p.Threshold = math.Min(6, p.Threshold*1.03)
+		p.Threshold = math.Min(6, p.Threshold*1.2)
 	}
 }
 

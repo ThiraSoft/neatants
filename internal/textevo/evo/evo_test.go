@@ -89,3 +89,25 @@ func TestChampionSurvivesUnchanged(t *testing.T) {
 		t.Fatal("the champion was not carried over")
 	}
 }
+
+// The threshold must follow the population as it converges: relatives soon
+// differ by a few hundredths in Compatibility, far under the 2.0 the
+// threshold starts at, and the species count must still reach the band.
+func TestSpeciesStayInBand(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Pop = 200
+	p := New(cfg, 32)
+	in := 0
+	var counts []int
+	for gen := range 100 {
+		p.Next(scores(p, toy))
+		counts = append(counts, len(p.Species))
+		if gen >= 50 && len(p.Species) >= cfg.MinSpecies && len(p.Species) <= cfg.MaxSpecies {
+			in++
+		}
+	}
+	t.Logf("species per generation: %v, threshold %.4f", counts, p.Threshold)
+	if in < 40 {
+		t.Fatalf("only %d of the last 50 generations have %d to %d species", in, cfg.MinSpecies, cfg.MaxSpecies)
+	}
+}
