@@ -68,6 +68,7 @@ type Monster struct {
 	Hits          float64 // ants struck and killed (see monKillReward), the brain's fitness
 	LastHurtByAnt int
 	sense         [MonInputs]float64
+	out           [MonOutputs]float64
 	feltHP        float64 // HP at the last thought, for the pain input
 }
 

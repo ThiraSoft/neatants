@@ -35,7 +35,7 @@ func TestPhaseCost(t *testing.T) {
 				if a.Alive {
 					w.fillInputs(a, in[:])
 					a.Sense = in
-					o := a.Net.Activate(in[:])
+					o := think(a.Net, in[:], make([]float64, AntOutputs))
 					outs[i] = append([]float64(nil), o...)
 				}
 			}

@@ -166,5 +166,5 @@ func (w *World) monsterThink(m *Monster, prey *Ant, preyD, senseR float64) []flo
 	in[17] = float64(m.Age) / float64(max(1, m.MaxAge))
 	in[18] = pain(m.feltHP, m.HP, m.MaxHP)
 	m.feltHP = m.HP
-	return m.Net.Activate(in)
+	return think(m.Net, in, m.out[:])
 }

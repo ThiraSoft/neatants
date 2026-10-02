@@ -26,7 +26,7 @@ func BenchmarkBrainParts(b *testing.B) {
 			t1 := time.Now()
 			w.fillTargets(a, in[NumSenseDirs*SenseCh+AntStateIn:], math.Cos(a.Angle), math.Sin(a.Angle))
 			t2 := time.Now()
-			a.Net.Activate(in[:])
+			think(a.Net, in[:], a.lastOut[:])
 			t3 := time.Now()
 			tIn += t1.Sub(t0) - t2.Sub(t1) // fillInputs includes one fillTargets call
 			tTg += t2.Sub(t1)

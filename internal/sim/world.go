@@ -910,7 +910,7 @@ func (w *World) brainChunk(s, e int) {
 			continue
 		}
 		w.fillInputs(a, a.Sense[:])
-		w.outs[i] = a.Net.Activate(a.Sense[:])
+		w.outs[i] = think(a.Net, a.Sense[:], a.lastOut[:])
 	}
 }
 
@@ -1945,3 +1945,16 @@ func (w *World) relocateNest(c *Colony) {
 
 // V builds a Vec2 from its coordinates.
 func V(x, y float64) Vec2 { return Vec2{x, y} }
+
+// think runs net on the float64 senses of the simulation and writes its
+// outputs into out, which it returns. Networks compute in float32.
+func think(net *neat.Network, in, out []float64) []float64 {
+	var buf [max(AntInputs, MonInputs)]float32
+	for i, x := range in {
+		buf[i] = float32(x)
+	}
+	for i, x := range net.Activate(buf[:len(in)]) {
+		out[i] = float64(x)
+	}
+	return out
+}
