@@ -46,7 +46,7 @@ func benchGenomes() ([]*neat.Genome, string) {
 
 // BenchmarkDispatch times one dispatch of n networks that are already on the
 // card, which is the steady state of a run. ms/dispatch is the wall clock of
-// Begin, Start and Finish; gpu-ms-med and gpu-ms-min are the card's own time
+// Open, Start and Finish; gpu-ms-med and gpu-ms-min are the card's own time
 // for the dispatch alone, which stays steady when another program shares the
 // card, so they are the figures to compare kernels with.
 func BenchmarkDispatch(b *testing.B) {
@@ -70,16 +70,16 @@ func BenchmarkDispatch(b *testing.B) {
 			}
 			in := make([]float64, 67)
 			r := rand.New(rand.NewSource(1))
-			// Set costs the CPU, not the card, so it runs once. The loop
+			// Add costs the CPU, not the card, so it runs once. The loop
 			// re-opens the round (which forgets the births, or Start would
 			// upload every network again) and times Start and Finish on the
 			// same requests.
-			bt.Begin(n)
-			for i, net := range nets {
+			bt.Open(n)
+			for _, net := range nets {
 				for k := range in {
 					in[k] = r.Float64()*2 - 1
 				}
-				bt.Set(i, net, in)
+				bt.Add(net, in)
 			}
 			for range 2 { // the first round uploads the networks
 				if err := bt.Start(); err != nil {
@@ -98,7 +98,7 @@ func BenchmarkDispatch(b *testing.B) {
 			var gpu []float64 // card-side time of the dispatch alone, in ms
 			b.ResetTimer()
 			for range b.N {
-				bt.Begin(n) // forgets the births, keeps the requests
+				bt.births = bt.births[:0] // forgets the births, keeps the requests
 				if err := bt.Start(); err != nil {
 					b.Fatal(err)
 				}

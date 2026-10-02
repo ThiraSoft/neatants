@@ -14,7 +14,8 @@ import (
 type group struct {
 	worlds []*sim.World
 	batch  *gpubrain.Batch
-	first  []int // first request of each world in the batch
+	idx    [][]int // per world, the batch index of each of its Thoughts, reused between rounds
+	last   int     // requests of the previous round, to size the next
 }
 
 func newGroup(d *vk.Device, worlds []*sim.World) (*group, error) {
@@ -27,37 +28,66 @@ func newGroup(d *vk.Device, worlds []*sim.World) (*group, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &group{worlds: worlds, batch: b, first: make([]int, len(worlds)+1)}, nil
+	return &group{worlds: worlds, batch: b, idx: make([][]int, len(worlds))}, nil
 }
 
-// sense runs Sense on every world and fills the batch.
-func (g *group) sense() {
-	forEach(len(g.worlds), func(i int) { g.worlds[i].Sense() })
-	for i, w := range g.worlds {
-		g.first[i+1] = g.first[i] + len(w.Thoughts)
-	}
-	g.batch.Begin(g.first[len(g.worlds)])
+// collect copies the outputs of the round that finished into the Thoughts.
+// It must run before open, which invalidates them.
+func (g *group) collect() {
 	forEach(len(g.worlds), func(i int) {
 		for j, t := range g.worlds[i].Thoughts {
-			g.batch.Set(g.first[i]+j, t.Net, t.In)
+			o := g.batch.Out(g.idx[i][j])
+			for k := range t.Out {
+				t.Out[k] = float64(o[k])
+			}
 		}
 	})
+}
+
+// round opens a batch and, in one pass per world, optionally acts on the
+// outputs collected, senses, and queues every Thought. One barrier only: the
+// workers do not wait for the slowest world between the phases.
+func (g *group) round(act bool) {
+	// The capacity covers the last round with some room; the batch doubles it
+	// anyway after an overflow.
+	g.batch.Open(g.last*5/4 + 64*len(g.worlds))
+	forEach(len(g.worlds), func(i int) {
+		w := g.worlds[i]
+		if act {
+			w.Act() // the per-world save flag is ignored: RunWorlds saves the merged worlds
+			w.Events = w.Events[:0]
+		}
+		w.Sense()
+		idx := g.idx[i][:0]
+		for _, t := range w.Thoughts {
+			idx = append(idx, g.batch.Add(t.Net, t.In))
+		}
+		g.idx[i] = idx
+	})
+	g.last = 0
+	for _, idx := range g.idx {
+		g.last += len(idx)
+	}
+}
+
+// sense runs Sense on every world and fills the batch, without an Act before.
+func (g *group) sense() { g.round(false) }
+
+// step acts on the outputs of the finished round, then senses and fills the batch.
+func (g *group) step() {
+	g.collect()
+	g.round(true)
 }
 
 func (g *group) start() error  { return g.batch.Start() }
 func (g *group) finish() error { return g.batch.Finish() }
 
-// act copies the outputs back and runs Act on every world.
+// act copies the outputs back and runs Act on every world, without a new Sense.
 func (g *group) act() {
+	g.collect()
 	forEach(len(g.worlds), func(i int) {
 		w := g.worlds[i]
-		for j, t := range w.Thoughts {
-			o := g.batch.Out(g.first[i] + j)
-			for k := range t.Out {
-				t.Out[k] = float64(o[k])
-			}
-		}
-		w.Act() // the per-world save flag is ignored: RunWorlds saves the merged worlds
+		w.Act()
 		w.Events = w.Events[:0]
 	})
 }
@@ -119,8 +149,7 @@ func (p *pipeline) half(done, next *group) error {
 		return err
 	}
 	t = time.Now()
-	done.act()
-	done.sense()
+	done.step()
 	p.cpuStep += time.Since(t)
 	return nil
 }

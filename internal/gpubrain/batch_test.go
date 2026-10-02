@@ -88,13 +88,13 @@ func TestBatchMatchesCPU(t *testing.T) {
 				asked = append(asked, e)
 			}
 		}
-		b.Begin(len(asked))
+		b.Open(len(asked))
 		ins := make([][]float32, len(asked))
 		for i, e := range asked {
 			for k := range in {
 				in[k] = float64(float32(r.Float64()*2 - 1))
 			}
-			b.Set(i, e.gpu, in)
+			b.Add(e.gpu, in)
 			ins[i] = make([]float32, 67)
 			for k, x := range in {
 				ins[i][k] = float32(x)
@@ -139,18 +139,18 @@ func TestSlotReuseStartsFresh(t *testing.T) {
 	}
 	old := grown(5, 2000).BuildNetwork()
 	for range 20 {
-		b.Begin(1)
-		b.Set(0, old, in)
+		b.Open(1)
+		b.Add(old, in)
 		run(t, b)
 	}
 	for range 3 { // nobody asks: old's slot expires
-		b.Begin(0)
+		b.Open(0)
 		run(t, b)
 	}
 	g := grown(6, 2000)
 	young, ref := g.BuildNetwork(), g.BuildNetwork()
-	b.Begin(1)
-	b.Set(0, young, in)
+	b.Open(1)
+	b.Add(young, in)
 	run(t, b)
 	in32 := make([]float32, 67)
 	for k := range in32 {
@@ -178,8 +178,8 @@ func TestOversizedRunsOnCPU(t *testing.T) {
 	g := oversized(7)
 	big, ref := g.BuildNetwork(), g.BuildNetwork()
 	in := make([]float64, 67)
-	b.Begin(1)
-	b.Set(0, big, in)
+	b.Open(1)
+	b.Add(big, in)
 	run(t, b)
 	want := ref.Activate(make([]float32, 67))
 	for k, x := range b.Out(0) {
@@ -214,10 +214,10 @@ func TestLayoutMatchesShader(t *testing.T) {
 	}
 }
 
-// TestConcurrentSetMixed calls Set from 8 goroutines with far more births than
+// TestConcurrentAddMixed calls Add from 8 goroutines with far more births than
 // the staging buffer and the arena start with, and with networks too big for a
 // slot among the live requests, so the kernel has to skip those.
-func TestConcurrentSetMixed(t *testing.T) {
+func TestConcurrentAddMixed(t *testing.T) {
 	d := device(t)
 	b, err := New(d, 72, 8, 3, 2)
 	if err != nil {
@@ -245,14 +245,15 @@ func TestConcurrentSetMixed(t *testing.T) {
 				ins[i][k] = float64(float32(r.Float64()*2 - 1))
 			}
 		}
-		b.Begin(len(order))
+		b.Open(len(order))
+		idx := make([]int, len(order))
 		var wg sync.WaitGroup
 		for w := range 8 {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				for i := w; i < len(order); i += 8 {
-					b.Set(i, gpu[order[i]], ins[i])
+					idx[i] = b.Add(gpu[order[i]], ins[i])
 				}
 			}()
 		}
@@ -267,7 +268,7 @@ func TestConcurrentSetMixed(t *testing.T) {
 			for k, x := range ins[i] {
 				in32[k] = float32(x)
 			}
-			want, got := cpu[n].Activate(in32), b.Out(i)
+			want, got := cpu[n].Activate(in32), b.Out(idx[i])
 			for k := range want {
 				if diff := math.Abs(float64(got[k] - want[k])); diff > bound {
 					t.Fatalf("round %d request %d output %d: GPU %v, CPU %v", round, i, k, got[k], want[k])
@@ -313,6 +314,79 @@ func TestBackCopiesAreDense(t *testing.T) {
 	for i, k := range f.Kind {
 		if dst[kindOff+i]&0xFF != uint32(k) {
 			t.Fatalf("node %d: kind word %#x lost kind %d", i, dst[kindOff+i], k)
+		}
+	}
+}
+
+// TestOverflowRunsOnCPUThenGrows asks for more requests than the round has
+// room for, from 8 goroutines: every output must match a CPU twin, the
+// overflow must show in Stats, and the next Open must have grown so the same
+// load fits.
+func TestOverflowRunsOnCPUThenGrows(t *testing.T) {
+	d := device(t)
+	b, err := New(d, 72, 8, 3, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	const n = 40
+	r := rand.New(rand.NewSource(5))
+	for round := range 3 {
+		// Fresh networks each round: one that overflows runs on its CPU copy,
+		// which does not follow what the card has learned.
+		var gpu, cpu []*neat.Network
+		for i := range n {
+			g := grown(int64(300+round*n+i), 2000)
+			gpu, cpu = append(gpu, g.BuildNetwork()), append(cpu, g.BuildNetwork())
+		}
+		ins := make([][]float64, n)
+		for i := range ins {
+			ins[i] = make([]float64, 67)
+			for k := range ins[i] {
+				ins[i][k] = float64(float32(r.Float64()*2 - 1))
+			}
+		}
+		b.Open(4)
+		idx := make([]int, n)
+		var wg sync.WaitGroup
+		for w := range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := w; i < n; i += 8 {
+					idx[i] = b.Add(gpu[i], ins[i])
+				}
+			}()
+		}
+		wg.Wait()
+		run(t, b)
+		seen := map[int]bool{}
+		for i := range n {
+			if seen[idx[i]] || idx[i] >= n {
+				t.Fatalf("round %d: request %d got index %d twice or out of range", round, i, idx[i])
+			}
+			seen[idx[i]] = true
+			in32 := make([]float32, 67)
+			for k, x := range ins[i] {
+				in32[k] = float32(x)
+			}
+			want, got := cpu[i].Activate(in32), b.Out(idx[i])
+			for k := range want {
+				if diff := math.Abs(float64(got[k] - want[k])); diff > 1e-3 {
+					t.Fatalf("round %d request %d output %d: GPU %v, CPU %v", round, i, k, got[k], want[k])
+				}
+			}
+		}
+		_, _, onCPU := b.Stats()
+		switch round {
+		case 0:
+			if onCPU != n-8 {
+				t.Fatalf("round 0: %d run on the CPU, want %d", onCPU, n-8)
+			}
+		case 1:
+			if onCPU != 0 {
+				t.Fatalf("round 1: %d still overflow after growing", onCPU)
+			}
 		}
 	}
 }

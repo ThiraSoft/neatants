@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/vk"
@@ -28,7 +29,7 @@ const (
 // being asked for (ttl rounds): its weights learn and its cells remember on
 // the card, and only the inputs and the outputs cross the bus each round.
 //
-// A round is Begin, Set for each request (from any goroutines), Start, then
+// A round is Open, Add for each request (from any goroutines), Start, then
 // Finish once the caller has done something else, then Out.
 type Batch struct {
 	d                   *vk.Device
@@ -50,10 +51,12 @@ type Batch struct {
 	owner    []*neat.Network
 	lastSeen []int
 	round    int
-	births   []birth     // newborns of this round: slot and staging index
-	lastBorn int         // births of the previous round
-	cpuOut   [][]float32 // per request, set for networks run on the CPU
-	n        int         // requests this round
+	births   []birth           // newborns of this round: slot and staging index
+	lastBorn int               // births of the previous round
+	cpuOut   [][]float32       // per request below reqCap, set for networks too big for a slot
+	overflow map[int][]float32 // outputs of the requests past reqCap, under mu
+	count    atomic.Int64      // requests asked this round, overflowing ones included
+	n        int               // requests dispatched this round
 
 	uploaded, freed, onCPU int
 }
@@ -118,6 +121,7 @@ func (b *Batch) allocRequests(n int) error {
 	}
 	b.reqCap = n
 	b.slots = make([]uint32, n)
+	b.cpuOut = make([][]float32, n)
 	return b.rebuildSet()
 }
 
@@ -131,24 +135,32 @@ func (b *Batch) rebuildSet() error {
 	return err
 }
 
-// Begin opens a round of n requests. It grows the request buffers by
-// doubling when n does not fit. Nothing may be in flight.
-func (b *Batch) Begin(n int) {
+// Open starts a round that will take up to about capacity requests, appended
+// by Add from any goroutines. Nothing of this batch may be in flight. The
+// request buffers grow, by doubling at least, when capacity does not fit or
+// when the last round overflowed, so after a warm-up they cover the peak and
+// nothing runs on the CPU for lack of room.
+func (b *Batch) Open(capacity int) {
 	b.round++
-	b.n = n
+	last := int(b.count.Swap(0))
 	b.lastBorn = len(b.births)
 	b.births = b.births[:0]
 	b.shrinkStaging()
-	b.cpuOut = make([][]float32, n)
-	if n > b.reqCap {
-		if err := b.allocRequests(max(n, 2*b.reqCap)); err != nil {
+	want := max(capacity, b.reqCap)
+	if last > b.reqCap {
+		want = max(want, 2*b.reqCap, last)
+	}
+	if want > b.reqCap {
+		if err := b.allocRequests(want); err != nil {
 			panic("gpubrain: growing the request buffers: " + err.Error())
 		}
 	}
+	clear(b.cpuOut)
+	b.overflow = nil
 }
 
 // shrinkStaging gives the staging buffer back at its starting size once a
-// burst of births is over. It is not in flight at Begin.
+// burst of births is over. It is not in flight at Open.
 func (b *Batch) shrinkStaging() {
 	if b.stageCap == stageStart || b.stageCap <= 4*b.lastBorn {
 		return
@@ -162,24 +174,36 @@ func (b *Batch) shrinkStaging() {
 	b.stageCap = stageStart
 }
 
-// Set asks for network net to think about in as request i. It is safe to
-// call from several goroutines for distinct i. A network that is not on the
-// card yet is packed into the staging buffer and given a slot; one that does
-// not fit a slot is run on the CPU right away.
-func (b *Batch) Set(i int, net *neat.Network, in []float64) {
+// Add queues net to think about in and returns the request's index, for Out.
+// It is safe from many goroutines. A network that is not on the card yet is
+// packed into the staging buffer and given a slot. One that does not fit a
+// slot, or a request past the round's capacity, is run on the CPU right away,
+// so Add never fails and never grows a buffer the card may read. A network
+// that stays on the card but overflows once runs on its CPU copy for that
+// round, which does not see what the card has learned; it is rare and the
+// next Open grows the capacity.
+func (b *Batch) Add(net *neat.Network, in []float64) int {
 	if len(in) > b.inStride {
 		panic(fmt.Sprintf("gpubrain: %d inputs for a batch built for %d", len(in), b.inStride))
+	}
+	i := int(b.count.Add(1) - 1)
+	if i >= b.reqCap {
+		out := cpuThink(net, in)
+		b.mu.Lock()
+		if b.overflow == nil {
+			b.overflow = map[int][]float32{}
+		}
+		b.overflow[i] = out
+		b.onCPU++
+		b.mu.Unlock()
+		return i
 	}
 	slot := uint32(net.Tag)
 	if net.Tag < 0 {
 		slot = b.admit(net)
 	}
 	if slot == noSlot {
-		in32 := make([]float32, len(in))
-		for k, x := range in {
-			in32[k] = float32(x)
-		}
-		b.cpuOut[i] = append([]float32(nil), net.Activate(in32)...)
+		b.cpuOut[i] = cpuThink(net, in)
 	} else {
 		// Missing inputs read as 0, as on the CPU, so the stale values of
 		// the previous round must not stay.
@@ -192,6 +216,15 @@ func (b *Batch) Set(i int, net *neat.Network, in []float64) {
 		}
 	}
 	b.slots[i] = slot
+	return i
+}
+
+func cpuThink(net *neat.Network, in []float64) []float32 {
+	in32 := make([]float32, len(in))
+	for k, x := range in {
+		in32[k] = float32(x)
+	}
+	return append([]float32(nil), net.Activate(in32)...)
 }
 
 // admit gives a newborn a slot, or returns noSlot when the network is too
@@ -262,6 +295,7 @@ func (b *Batch) growStaging() {
 // reusable from the next round, so it can never be handed to a birth that is
 // already staged.
 func (b *Batch) Start() error {
+	b.n = min(int(b.count.Load()), b.reqCap)
 	for _, slot := range b.slots[:b.n] {
 		if slot != noSlot {
 			b.lastSeen[slot] = b.round
@@ -307,8 +341,11 @@ func (b *Batch) Finish() error {
 }
 
 // Out returns the outputs of request i, valid after Finish. The caller reads
-// only as many as its network has. The slice is valid until the next Begin.
+// only as many as its network has. The slice is valid until the next Open.
 func (b *Batch) Out(i int) []float32 {
+	if i >= b.reqCap {
+		return b.overflow[i]
+	}
 	if b.cpuOut[i] != nil {
 		return b.cpuOut[i]
 	}
