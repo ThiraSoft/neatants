@@ -71,7 +71,7 @@ func (g *Genome) BuildNetwork() *Network {
 		from, slot int
 		w, hebb    float64
 	}
-	var edges []edge
+	edges := make([]edge, 0, len(g.Conns))
 	deps := make([][]int, nc)
 	for _, c := range g.Conns {
 		fi, okIn := idMap[c.In]
