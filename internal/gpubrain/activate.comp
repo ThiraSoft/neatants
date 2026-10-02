@@ -1,0 +1,109 @@
+#version 450
+// One workgroup thinks for one network: the nodes of a level are spread over
+// the lanes, a barrier separates levels (a node only reads lower levels from
+// this tick, see neat.Flat). It computes exactly what neat.Network.Activate
+// computes; `precise` keeps the compiler from fusing the multiply-adds, so
+// the results stay those of the CPU but for the division in fast_tanh.
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) buffer Arena { uint arena[]; };
+layout(std430, binding = 1) readonly buffer Req { uint slots[]; };
+layout(std430, binding = 2) readonly buffer In { float inputs[]; };
+layout(std430, binding = 3) writeonly buffer Out { float outputs[]; };
+
+layout(push_constant) uniform Push {
+	uint count;
+	uint inStride;
+	uint outStride;
+} pc;
+
+#define HDR 8u
+#define KIND_OFF HDR
+#define ORDER_OFF (KIND_OFF + MAX_NODES)
+#define LEVEL_OFF (ORDER_OFF + MAX_NODES)
+#define OFF_OFF (LEVEL_OFF + MAX_NODES + 1u)
+#define FROM_OFF (OFF_OFF + 4u * MAX_NODES + 1u)
+#define WEIGHT_OFF (FROM_OFF + MAX_EDGES)
+#define PL_OFF (WEIGHT_OFF + MAX_EDGES)
+#define VALS_OFF (PL_OFF + 4u * MAX_PLASTIC)
+#define CELL_OFF (VALS_OFF + MAX_NODES)
+#define SLOT_WORDS (CELL_OFF + MAX_NODES)
+#define MEMORY 4u
+
+shared float v[2u * MAX_NODES];
+
+float fast_tanh(float x) {
+	if (x > 3.0) return 1.0;
+	if (x < -3.0) return -1.0;
+	precise float x2 = x * x;
+	precise float num = x * (27.0 + x2);
+	precise float den = 27.0 + 9.0 * x2;
+	return num / den;
+}
+float sig(float x) { precise float y = 0.5 + 0.5 * fast_tanh(2.45 * x); return y; }
+float sig01(float x) { precise float y = 0.5 + 0.5 * fast_tanh(0.5 * x); return y; }
+
+float wsum(uint base, uint slot) {
+	precise float s = 0.0;
+	uint e = arena[base + OFF_OFF + slot + 1u];
+	for (uint k = arena[base + OFF_OFF + slot]; k < e; k++) {
+		precise float p = v[arena[base + FROM_OFF + k]] * uintBitsToFloat(arena[base + WEIGHT_OFF + k]);
+		s = s + p;
+	}
+	return s;
+}
+
+void main() {
+	uint r = gl_WorkGroupID.x;
+	if (r >= pc.count) return;
+	if (slots[r] == 0xFFFFFFFFu) return;
+	uint lane = gl_LocalInvocationID.x;
+	uint base = slots[r] * SLOT_WORDS;
+	uint n = arena[base + 0u];
+	uint nLevels = arena[base + 2u];
+	uint nPlastic = arena[base + 3u];
+	uint inStart = arena[base + 4u], inEnd = arena[base + 5u];
+	uint outStart = arena[base + 6u], outEnd = arena[base + 7u];
+
+	for (uint i = lane; i < n; i += 32u) v[i] = uintBitsToFloat(arena[base + VALS_OFF + i]);
+	barrier();
+	if (lane == 0u) v[0] = 1.0;
+	for (uint i = inStart + lane; i < inEnd; i += 32u) v[i] = inputs[r * pc.inStride + (i - inStart)];
+	barrier();
+	for (uint i = lane; i < n; i += 32u) v[n + i] = v[i];
+	barrier();
+
+	for (uint l = 0u; l < nLevels; l++) {
+		uint s = arena[base + LEVEL_OFF + l], e = arena[base + LEVEL_OFF + l + 1u];
+		for (uint j = s + lane; j < e; j += 32u) {
+			uint ni = arena[base + ORDER_OFF + j];
+			uint gb = ni * 4u;
+			if (arena[base + KIND_OFF + ni] != MEMORY) {
+				v[ni] = sig(wsum(base, gb));
+			} else {
+				precise float x = wsum(base, gb);
+				precise float ig = sig01(wsum(base, gb + 1u) + 2.0);
+				precise float fg = sig01(wsum(base, gb + 2u) + 2.0);
+				precise float og = sig01(wsum(base, gb + 3u) + 2.0);
+				precise float c = fg * uintBitsToFloat(arena[base + CELL_OFF + ni]) + ig * fast_tanh(x);
+				arena[base + CELL_OFF + ni] = floatBitsToUint(c);
+				precise float y = og * fast_tanh(c);
+				v[ni] = y;
+			}
+		}
+		barrier();
+	}
+
+	for (uint i = outStart + lane; i < outEnd; i += 32u) outputs[r * pc.outStride + (i - outStart)] = v[i];
+	for (uint p = lane; p < nPlastic; p += 32u) {
+		uint at = base + PL_OFF + 4u * p;
+		uint k = arena[at];
+		float pre = v[arena[at + 1u]], post = v[arena[at + 2u]];
+		float eta = uintBitsToFloat(arena[at + 3u]);
+		float w = uintBitsToFloat(arena[base + WEIGHT_OFF + k]);
+		precise float nw = w + eta * post * (pre - post * w);
+		arena[base + WEIGHT_OFF + k] = floatBitsToUint(clamp(nw, -8.0, 8.0));
+	}
+	for (uint i = lane; i < n; i += 32u) arena[base + VALS_OFF + i] = floatBitsToUint(v[i]);
+}
