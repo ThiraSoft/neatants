@@ -72,6 +72,10 @@ func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
 	if data.Dim%2 != 0 {
 		return nil, fmt.Errorf("gpu: the embedding dimension %d must be even", data.Dim)
 	}
+	// The scalar cross-entropy kernel reads the embedding in tiles 32 wide.
+	if data.Dim%32 != 0 {
+		return nil, fmt.Errorf("gpu: the embedding dimension %d must be a multiple of 32", data.Dim)
+	}
 	var err error
 	for i, ids := range [2][]int32{data.Train, data.Val} {
 		w := make([]uint32, max(len(ids), 1))

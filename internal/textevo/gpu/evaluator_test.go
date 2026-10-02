@@ -273,3 +273,18 @@ func TestEvaluatorRejectsWrongShape(t *testing.T) {
 	}()
 	e.Evaluate([]*neat.Genome{model.NewGenome(1, 16)}, []int{0}, 64, 16)
 }
+
+// The scalar cross-entropy kernel reads 32-wide tiles, so a dimension that is
+// not a multiple of 32 must be refused up front.
+func TestNewRejectsDimNotMultipleOf32(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 48, 3000, 7)
+	e, err := New(dev, d)
+	if err == nil {
+		e.Close()
+		t.Fatal("New accepted dimension 48")
+	}
+	if !strings.Contains(err.Error(), "multiple of 32") {
+		t.Fatalf("unclear error: %v", err)
+	}
+}
