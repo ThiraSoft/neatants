@@ -32,12 +32,19 @@ func benchGen(b *testing.B, make func(i int, dim int) *neat.Genome, mode string)
 
 // benchPop is benchGen for a population of n genomes.
 func benchPop(b *testing.B, n int, make func(i int, dim int) *neat.Genome, mode string) {
+	benchPopOn(b, nil, n, make, mode)
+}
+
+// benchPopOn is benchPop on the data d, or on benchData's when d is nil.
+func benchPopOn(b *testing.B, d *prep.Data, n int, make func(i int, dim int) *neat.Genome, mode string) {
 	d0, err := vk.Open()
 	if err != nil {
 		b.Skip(err)
 	}
 	defer d0.Close()
-	d := benchData(b)
+	if d == nil {
+		d = benchData(b)
+	}
 	gs := make_pop(n, d.Dim, make)
 	e, err := New(d0, d)
 	if err != nil {
@@ -170,3 +177,30 @@ func TestRealisticSizes(t *testing.T) {
 		t.Logf("%s: %d nodes, %d edges, %d memory, %d plastic, %d levels, fits %v", name, f.Nodes(), len(f.From), mem, len(f.Plastic), len(f.LevelStart)-1, Fits(f))
 	}
 }
+
+// benchDense runs a first generation of dense genomes (every output reads all
+// the inputs) on the prepared file of dimension dim, mutated a few times as
+// the children of the first generations are.
+func benchDense(b *testing.B, file string, dim int, mode string) {
+	d, err := prep.Load("../../../data/" + file)
+	if err != nil {
+		b.Logf("no data/%s, synthetic data of the same size", file)
+		d = model.Synthetic(12000, dim, 300000, 1)
+	}
+	defer func(k int) { neat.MinimalLinks = k }(neat.MinimalLinks)
+	neat.MinimalLinks = dim
+	benchPopOn(b, d, 200, func(i, dim int) *neat.Genome {
+		g := model.NewGenome(i+1, dim)
+		for range 3 {
+			g.Mutate()
+		}
+		return g
+	}, mode)
+}
+
+func BenchmarkDensePop200D128(b *testing.B) { benchDense(b, "prep.bin", 128, "") }
+func BenchmarkDensePop200D64(b *testing.B)  { benchDense(b, "prep64.bin", 64, "") }
+func BenchmarkDensePop200D32(b *testing.B)  { benchDense(b, "prep32.bin", 32, "") }
+func BenchmarkDenseNet200D128(b *testing.B) { benchDense(b, "prep.bin", 128, "net") }
+func BenchmarkDenseNet200D64(b *testing.B)  { benchDense(b, "prep64.bin", 64, "net") }
+func BenchmarkDenseNet200D32(b *testing.B)  { benchDense(b, "prep32.bin", 32, "net") }

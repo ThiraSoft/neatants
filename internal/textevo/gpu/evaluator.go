@@ -94,15 +94,18 @@ func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
 	if e.netPipe, err = newNetPipes(d); err != nil {
 		return nil, err
 	}
-	// The matrix cores take xent when the device has them and the embedding is
-	// the width the kernel was built for; NEATTEXT_SCALAR_XENT forces the
+	// The matrix cores take xent when the device has them and the kernel was
+	// built for the embedding's width; NEATTEXT_SCALAR_XENT forces the
 	// scalar kernel, to compare the two.
-	e.coop = d.Coopmat() && data.Dim == xentCoopDim && os.Getenv("NEATTEXT_SCALAR_XENT") == ""
+	_, built := xentCoopSPV[data.Dim]
+	e.coop = d.Coopmat() && built && os.Getenv("NEATTEXT_SCALAR_XENT") == ""
 	e.xentRows = 64
+	coopDim := 0
 	if e.coop {
 		e.xentRows = xentCoopRows
+		coopDim = data.Dim
 	}
-	if e.xentPipe, err = newXentPipe(d, e.coop, xentCoopWave); err != nil {
+	if e.xentPipe, err = newXentPipe(d, coopDim, xentCoopWave); err != nil {
 		return nil, err
 	}
 	ok = true

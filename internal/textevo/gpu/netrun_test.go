@@ -214,3 +214,56 @@ func TestNetrunBigVariant(t *testing.T) {
 		t.Fatalf("worst difference %g", worst)
 	}
 }
+
+// A dense first generation (every output reads all D inputs and the bias)
+// at D = 128 puts 128 outputs of 129 edges in one level, 16512 edges: Pack
+// must split it so that each piece fits LevelEdges, and the run must stay
+// the network's.
+func TestNetrunDenseStart(t *testing.T) {
+	dev := device(t)
+	const D = 128
+	defer func(k int) { neat.MinimalLinks = k }(neat.MinimalLinks)
+	neat.MinimalLinks = D
+	d := model.Synthetic(300, D, 2000, 5)
+	var gs []*neat.Genome
+	for i := range 4 {
+		g := model.NewGenome(i+1, D)
+		for range 20 * i {
+			g.Mutate()
+		}
+		f := g.BuildNetwork().Flat()
+		if c := netClass(f); c != 0 {
+			t.Fatalf("genome %d runs in variant %d, want the small one", i, c)
+		}
+		if i == 0 {
+			if len(f.From) != D*(D+1) {
+				t.Fatalf("%d edges, want %d", len(f.From), D*(D+1))
+			}
+			if u := checkRecord(t, f, Pack(nil, f)); u.nLevels < D*(D+1)/LevelEdges {
+				t.Fatalf("the output level was split in %d, want at least %d", u.nLevels, D*(D+1)/LevelEdges)
+			}
+		}
+		gs = append(gs, g)
+	}
+	starts := []int{0, 900}
+	const L, W = 48, 16
+	rows, err := runNetrun(dev, d, gs, starts, L, W)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worst := 0.0
+	for gi, g := range gs {
+		for wi, s := range starts {
+			want := ref.Rows(g, d, d.Train, s, L, W)
+			for ti := range want {
+				for j := range want[ti] {
+					worst = math.Max(worst, math.Abs(float64(rows[gi][wi][ti][j]-want[ti][j])))
+				}
+			}
+		}
+	}
+	t.Logf("worst difference %g", worst)
+	if worst > 2e-3 {
+		t.Fatalf("worst difference %g", worst)
+	}
+}

@@ -54,8 +54,10 @@ shared uvec4 Bs[TC * RW];
 // whatever its product.
 shared vec4 Ps[TC / 4u];
 // The operand is read into registers once, before the first logits are stored,
-// so its staging area and the logits share their memory.
-shared vec4 Ss[TR * RW];
+// so its staging area and the logits share their memory, sized for the wider
+// of the two: under DIM 128 a row of logits is wider than a row of operand.
+#define SSW (uint(RW) > SW ? uint(RW) : SW)
+shared vec4 Ss[TR * SSW];
 
 const float LOG2E = 1.44269504088896340736;
 

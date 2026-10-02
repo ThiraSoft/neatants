@@ -1,6 +1,7 @@
 package gpu
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -29,12 +30,16 @@ func TestFloatToHalf(t *testing.T) {
 func TestXentMatchesCPU(t *testing.T) {
 	t.Run("scalar/D32", func(t *testing.T) { checkXent(t, 32, 0) })
 	t.Run("scalar/D128", func(t *testing.T) { checkXent(t, 128, 0) })
-	t.Run("coop/D128", func(t *testing.T) {
-		if !device(t).Coopmat() {
-			t.Skip("no cooperative matrices")
-		}
-		checkXent(t, 128, xentCoopWave)
-	})
+	// The matrix kernel is built for each width a run may prepare, since the
+	// scalar one is ten to twenty times slower.
+	for _, D := range []int{32, 64, 128} {
+		t.Run(fmt.Sprintf("coop/D%d", D), func(t *testing.T) {
+			if !device(t).Coopmat() {
+				t.Skip("no cooperative matrices")
+			}
+			checkXent(t, D, xentCoopWave)
+		})
+	}
 }
 
 // At a wave width it was not written for, xent_coop would divide its rows
@@ -101,7 +106,11 @@ func checkXent(t *testing.T, D int, wave uint32) {
 	if coop {
 		tile = xentCoopRows
 	}
-	pipe, err := newXentPipe(dev, coop, wave)
+	coopDim := 0
+	if coop {
+		coopDim = D
+	}
+	pipe, err := newXentPipe(dev, coopDim, wave)
 	if err != nil {
 		t.Fatal(err)
 	}

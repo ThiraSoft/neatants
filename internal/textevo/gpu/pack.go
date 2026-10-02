@@ -23,8 +23,12 @@ const (
 	MaxPlastic = 1024
 	// LevelEdges is the room for the products of one level, in both; Pack
 	// splits a longer level into several, so only one node's edges must
-	// fit.
-	LevelEdges = 256
+	// fit. A dense first generation at D = 128 has one level of 128 outputs
+	// of 129 edges, and the sums of a piece are serial walks of one lane a
+	// node: four outputs a piece (516 edges) instead of one at 256 took a
+	// dense pop 200 from 95 to 58 ms of netrun, for 6% more on the grown
+	// genomes of pop 1000 (2 KB more shared memory).
+	LevelEdges = 520
 
 	smallValues  = 1024
 	smallMemory  = 256
