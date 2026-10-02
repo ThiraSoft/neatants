@@ -70,3 +70,6 @@ func BenchmarkNetrunGrown(b *testing.B)    { benchGen(b, grown, "net") }
 func BenchmarkNetrunGen0(b *testing.B)     { benchGen(b, gen0, "net") }
 func BenchmarkXentOnly(b *testing.B)       { benchGen(b, gen0, "xent") }
 func BenchmarkNone(b *testing.B)           { benchGen(b, gen0, "none") }
+
+func grownBig(i, dim int) *neat.Genome { return model.Grown(int64(i), dim, 150) }
+func BenchmarkNetrunBig(b *testing.B)  { benchGen(b, grownBig, "net") }

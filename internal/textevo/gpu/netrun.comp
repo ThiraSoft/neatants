@@ -6,7 +6,7 @@
 // tick computes exactly what neat.Flat.Activate computes.
 
 #ifndef LANES
-#define LANES 64u
+#define LANES 256u
 #endif
 layout(local_size_x = LANES) in;
 
