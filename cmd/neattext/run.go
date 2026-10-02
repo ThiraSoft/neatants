@@ -45,19 +45,21 @@ func (c cpuEval) Validate(g *neat.Genome) (float64, error) {
 var header = []string{"gen", "best_bpb", "mean_bpb", "species", "nodes", "edges", "memory", "plastic", "oversized", "eval_ms", "total_ms", "val_bpb"}
 
 func runEvolve() {
-	if *dim%32 != 0 {
-		fail(2, "-dim must be a multiple of 32")
-	}
 	if *warm >= *length {
 		fail(2, "-warm must be smaller than -len")
 	}
 	if *pop**windows > 65535 {
 		fail(2, "-pop times -windows must not exceed 65535, the Vulkan dispatch limit")
 	}
-	d := load()
-	if d.Dim != *dim {
-		fail(2, "data/prep.bin has dim %d, -dim is %d", d.Dim, *dim)
+	if *links < 1 {
+		fail(2, "-links must be at least 1")
 	}
+	if *wmut <= 0 {
+		fail(2, "-wmut must be positive")
+	}
+	// The dimension is the prepared file's: -dim only tells -prep what to
+	// write, so a run never has to repeat it.
+	d := load()
 	if *length+1 >= len(d.Train) {
 		fail(2, "-len %d leaves no room in %d train tokens", *length, len(d.Train))
 	}
@@ -93,6 +95,7 @@ func runEvolve() {
 	w.Write(header)
 	fmt.Println(strings.Join(header, ","))
 
+	fmt.Printf("data %s, dim %d, links %d, wmut %g, pop %d\n", *dataPath, d.Dim, *links, *wmut, *pop)
 	printBaselines(d)
 
 	// Ctrl+C lets the generation in flight finish, then validates and saves.
@@ -102,6 +105,8 @@ func runEvolve() {
 	go func() { <-sig; stop.Store(true) }()
 
 	neat.HebbRate = *hebb
+	neat.MinimalLinks = *links
+	neat.WeightsPerMutation = *wmut
 	cfg := evo.DefaultConfig()
 	cfg.Pop = *pop
 	p := evo.New(cfg, d.Dim)
