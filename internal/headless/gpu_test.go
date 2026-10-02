@@ -54,3 +54,41 @@ func TestGroupTicksLikeCPU(t *testing.T) {
 		}
 	}
 }
+
+// TestPipelineKeepsWorldsInStep runs the A/B pipeline and checks that every
+// world advanced by exactly the number of steps, then stops mid-flight and
+// drains without deadlock.
+func TestPipelineKeepsWorldsInStep(t *testing.T) {
+	d, err := vk.Open()
+	if err != nil {
+		t.Skipf("no Vulkan device: %v", err)
+	}
+	defer d.Close()
+	sim.LoadConfig("config.yml")
+	sim.SavePath = t.TempDir() + "/colonies.json"
+	rand.Seed(2)
+	worlds := make([]*sim.World, 5)
+	for i := range worlds {
+		worlds[i] = sim.NewWorld()
+	}
+	p, err := newPipeline(d, worlds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.close()
+	if err := p.prime(); err != nil {
+		t.Fatal(err)
+	}
+	for range 300 {
+		if err := p.step(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.drain()
+	// prime runs the first Sense and drain the last Act: 301 ticks.
+	for i, w := range worlds {
+		if w.Tick != 301 {
+			t.Fatalf("world %d at tick %d after prime, 300 steps and drain", i, w.Tick)
+		}
+	}
+}

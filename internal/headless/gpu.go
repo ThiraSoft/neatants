@@ -3,6 +3,7 @@ package headless
 import (
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/ThiraSoft/golem/vk"
 	"github.com/ThiraSoft/neatants/internal/gpubrain"
@@ -62,6 +63,83 @@ func (g *group) act() {
 }
 
 func (g *group) close() { g.batch.Close() }
+
+// pipeline thinks for one half of the worlds on the card while the CPU
+// steps the other half, so neither waits for the other more than the
+// difference between the two. Only one dispatch is ever in flight, as
+// vk.Device.Start requires.
+type pipeline struct {
+	a, b *group
+	// cpuWait is the time the CPU spent waiting for the card. cpuStep is the
+	// time it spent stepping a half (Act and Sense): an upper bound of the
+	// card's busy time per half, since the card may finish earlier.
+	cpuWait, cpuStep time.Duration
+}
+
+func newPipeline(d *vk.Device, worlds []*sim.World) (*pipeline, error) {
+	h := (len(worlds) + 1) / 2
+	a, err := newGroup(d, worlds[:h])
+	if err != nil {
+		return nil, err
+	}
+	b, err := newGroup(d, worlds[h:])
+	if err != nil {
+		a.close()
+		return nil, err
+	}
+	return &pipeline{a: a, b: b}, nil
+}
+
+// prime runs the first Sense of every world and sets the card on A.
+func (p *pipeline) prime() error {
+	p.a.sense()
+	if err := p.a.start(); err != nil {
+		return err
+	}
+	p.b.sense()
+	return nil
+}
+
+// step advances every world by one tick.
+func (p *pipeline) step() error {
+	if err := p.half(p.a, p.b); err != nil {
+		return err
+	}
+	return p.half(p.b, p.a)
+}
+
+// half collects done's thoughts, sets the card on next, then steps done.
+func (p *pipeline) half(done, next *group) error {
+	t := time.Now()
+	if err := done.finish(); err != nil {
+		return err
+	}
+	p.cpuWait += time.Since(t)
+	if err := next.start(); err != nil {
+		return err
+	}
+	t = time.Now()
+	done.act()
+	done.sense()
+	p.cpuStep += time.Since(t)
+	return nil
+}
+
+// drain finishes the dispatch in flight and the pending ticks, so the worlds
+// can be saved. They are then between ticks: prime resumes them.
+func (p *pipeline) drain() {
+	if p.a.finish() == nil {
+		p.a.act()
+	}
+	if p.b.start() == nil && p.b.finish() == nil {
+		p.b.act()
+	}
+}
+
+func (p *pipeline) close() {
+	p.a.close()
+	p.b.close()
+}
 
 // forEach runs f(0..n-1) on at most NumCPU goroutines.
 func forEach(n int, f func(i int)) {

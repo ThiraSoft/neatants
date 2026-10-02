@@ -32,20 +32,34 @@ func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool) {
 		worlds[i].SerialBrains = true
 	}
 	var g *group
+	var p *pipeline
 	if gpu {
 		d, err := vk.Open()
 		if err == nil {
-			g, err = newGroup(d, worlds)
+			if n > 1 {
+				p, err = newPipeline(d, worlds)
+			} else {
+				g, err = newGroup(d, worlds)
+			}
 			if err != nil {
 				d.Close()
 			} else {
 				defer d.Close()
-				defer g.close()
+				if p != nil {
+					defer p.close()
+				} else {
+					defer g.close()
+				}
 			}
 		}
 		if err != nil {
 			fmt.Printf("[HEADLESS] no usable GPU (%v), thinking on the CPU\n", err)
 		}
+	}
+	gpuFail := func(err error) {
+		saveMerged(worlds)
+		fmt.Fprintf(os.Stderr, "[HEADLESS] GPU error, lineages saved: %v\n", err)
+		os.Exit(1)
 	}
 	var stopped atomic.Bool
 	stop := make(chan os.Signal, 1)
@@ -65,8 +79,26 @@ func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool) {
 		}
 		ran := make([]int, n)
 		var wg sync.WaitGroup
-		if g != nil {
-			// Lockstep: every world ticks together, so they all ran the same count.
+		if p != nil {
+			// Every world ticks together, so they all ran the same count. The
+			// pipeline's prime and drain add one tick to the steps.
+			count := 0
+			if err := p.prime(); err != nil {
+				gpuFail(err)
+			}
+			for k := 0; k < max(1, steps-1) && !(k%500 == 0 && stopped.Load()); k++ {
+				if err := p.step(); err != nil {
+					gpuFail(err)
+				}
+				count++
+			}
+			p.drain()
+			count++
+			for i := range ran {
+				ran[i] = count
+			}
+		} else if g != nil {
+			// A single world has nothing to overlap with: plain lockstep.
 			count := 0
 			for k := 0; k < steps && !(k%500 == 0 && stopped.Load()); k++ {
 				g.sense()
@@ -75,9 +107,7 @@ func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool) {
 					err = g.finish()
 				}
 				if err != nil {
-					saveMerged(worlds)
-					fmt.Fprintf(os.Stderr, "[HEADLESS] GPU error, lineages saved: %v\n", err)
-					os.Exit(1)
+					gpuFail(err)
 				}
 				g.act()
 				count++
@@ -87,7 +117,7 @@ func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool) {
 			}
 		}
 		for i, w := range worlds {
-			if g != nil {
+			if g != nil || p != nil {
 				break
 			}
 			wg.Add(1)
@@ -112,12 +142,25 @@ func RunWorlds(n, ticks, epoch int, every time.Duration, gpu bool) {
 			lastSave = time.Now()
 		}
 		if time.Since(last) >= every {
-			tps := float64(done-lastDone) / time.Since(last).Seconds()
+			window := time.Since(last)
+			ticks := done - lastDone
+			tps := float64(ticks) / window.Seconds()
 			last, lastDone = time.Now(), done
 			reportWorlds(worlds, tps, time.Since(start))
 			if g != nil {
 				up, freed, cpu := g.batch.Stats()
 				fmt.Printf("  GPU: %d networks uploaded, %d freed, %d run on the CPU\n", up, freed, cpu)
+			}
+			if p != nil {
+				var up, freed, cpu int
+				for _, h := range []*group{p.a, p.b} {
+					u, f, c := h.batch.Stats()
+					up, freed, cpu = up+u, freed+f, cpu+c
+				}
+				fmt.Printf("  GPU: %d networks uploaded, %d freed, %d run on the CPU\n", up, freed, cpu)
+				fmt.Printf("  cpu waited %.0f%% of the time for the GPU · CPU half-step %.2f ms\n",
+					100*p.cpuWait.Seconds()/window.Seconds(), p.cpuStep.Seconds()*1000/float64(max(1, 2*ticks)))
+				p.cpuWait, p.cpuStep = 0, 0
 			}
 		}
 	}
