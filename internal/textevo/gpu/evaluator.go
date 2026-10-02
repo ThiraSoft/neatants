@@ -213,6 +213,8 @@ func (e *Evaluator) grow(upBytes, genBytes, rowBytes, bitBytes int) error {
 
 // Evaluate returns the bits per byte of each genome on the train windows
 // at starts, +Inf for a genome too big for the kernel. Oversized counts them.
+// The genomes must not be changed in place afterwards: the next call compares
+// copies of them with them to reuse their records (copies may be changed).
 func (e *Evaluator) Evaluate(gs []*neat.Genome, starts []int, length, warm int) (bpb []float64, oversized int, err error) {
 	return e.evaluate(gs, 0, e.data.Train, starts, length, warm)
 }
@@ -321,23 +323,23 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 }
 
 // packed is the record of one genome, ready for the upload, or the fact that
-// it does not fit the kernel, with a copy of the genes it was built from.
+// it does not fit the kernel, with the genome it was built from. Keeping the
+// genome rather than a copy of its genes saves copying some hundred kilobytes
+// a genome every generation for a record only champions reuse.
 type packed struct {
-	rec     []uint32
-	fits    bool
-	class   int8
-	nodes   []neat.NodeGene
-	conns   []neat.ConnGene
-	inputs  int
-	outputs int
+	rec   []uint32
+	fits  bool
+	class int8
+	g     *neat.Genome
 }
 
 // same reports whether g has exactly the genes p was built from. Origin only
 // says what a genome was copied from: a caller may change the genes of a copy
 // without Mutate, and a stale record would then score another network.
 func (p *packed) same(g *neat.Genome) bool {
-	return p.inputs == g.NumInputs && p.outputs == g.NumOutputs &&
-		slices.Equal(p.nodes, g.Nodes) && slices.Equal(p.conns, g.Conns)
+	o := p.g
+	return o != nil && o.NumInputs == g.NumInputs && o.NumOutputs == g.NumOutputs &&
+		slices.Equal(o.Nodes, g.Nodes) && slices.Equal(o.Conns, g.Conns)
 }
 
 // pack builds the record of every genome. With cache set, an unchanged copy
@@ -360,8 +362,7 @@ func (e *Evaluator) pack(gs []*neat.Genome, cache bool) []packed {
 	parallel(len(gs), func(i int) {
 		g, s := gs[i], &slots[i]
 		if cache {
-			s.nodes, s.conns = append(s.nodes[:0], g.Nodes...), append(s.conns[:0], g.Conns...)
-			s.inputs, s.outputs = g.NumInputs, g.NumOutputs
+			s.g = g
 		}
 		if p := prev[g.Origin]; g.Origin > 0 && p != nil && p.same(g) {
 			s.fits, s.class, s.rec = p.fits, p.class, append(s.rec[:0], p.rec...)
