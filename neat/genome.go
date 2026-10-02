@@ -231,7 +231,11 @@ func NewGenomeWithHidden(id, inputs, outputs, hidden int) *Genome {
 		out := firstOutput + j
 		var reads []int
 		if hidden == 0 {
+			// In input order, so that the genes of a fresh genome are in the
+			// order of their innovations (numbered the first time they are
+			// met) and the sorted cache of a dense genome is almost free.
 			reads = rand.Perm(inputs)[:min(MinimalLinks, inputs)]
+			slices.Sort(reads)
 		} else {
 			for i := range inputs {
 				if rand.Float64() < DirectLinkRate {
@@ -439,16 +443,39 @@ var (
 // A neuron with no enabled outgoing link has no effect on the outputs. One
 // without inputs still is a constant (bias-like) source, so it is kept.
 func (g *Genome) prune() {
-	reads := make(map[int]bool, len(g.Nodes))
+	// Which nodes are read is a table by node ID when the IDs are small
+	// enough, since a map write for each of the sixteen thousand genes of a
+	// dense genome was a fifth of a text-evolution generation.
+	lo, top := 0, 0
+	for _, n := range g.Nodes {
+		lo, top = min(lo, n.ID), max(top, n.ID)
+	}
+	var table []bool
+	var set map[int]bool
+	if lo >= 0 && top < 64*len(g.Nodes)+1024 {
+		table = make([]bool, top+1)
+	} else {
+		set = make(map[int]bool, len(g.Nodes))
+	}
 	for _, c := range g.Conns {
 		if c.Enabled && c.In != c.Out {
-			reads[c.In] = true
+			if c.In >= 0 && c.In < len(table) {
+				table[c.In] = true
+			} else if set != nil {
+				set[c.In] = true
+			}
 		}
+	}
+	read := func(id int) bool {
+		if table != nil {
+			return id >= 0 && id < len(table) && table[id]
+		}
+		return set[id]
 	}
 	dead := map[int]bool{}
 	nodes := g.Nodes[:0]
 	for _, n := range g.Nodes {
-		if (n.Type == Hidden || n.Type == Memory) && !reads[n.ID] && rand.Float64() < PruneNodeRate {
+		if (n.Type == Hidden || n.Type == Memory) && !read(n.ID) && rand.Float64() < PruneNodeRate {
 			dead[n.ID] = true
 			continue
 		}
@@ -468,7 +495,10 @@ func (g *Genome) prune() {
 // addMemoryMutation inserts an LSTM cell fed by one node and read by another,
 // sometimes with its forget gate already driven by a third.
 // AddMemory inserts one LSTM cell (see addMemoryMutation).
-func (g *Genome) AddMemory() { g.addMemoryMutation() }
+func (g *Genome) AddMemory() {
+	g.sorted = nil
+	g.addMemoryMutation()
+}
 
 func (g *Genome) addMemoryMutation() {
 	var srcs, dsts []int
@@ -512,10 +542,18 @@ func (g *Genome) mutateWeightsAdaptive() {
 		return
 	}
 	rate := math.Min(1, WeightsPerMutation/float64(len(g.Conns)))
-	for i := range g.Conns {
-		if rand.Float64() >= rate {
-			continue
+	// Each connection is perturbed with probability rate. Rather than one
+	// draw per connection, the gap to the next perturbed one is drawn from
+	// the geometric law of that test, which is the same choice in a few draws
+	// instead of sixteen thousand for a dense genome.
+	logq := math.Log1p(-rate)
+	gap := func() int {
+		if rate >= 1 {
+			return 0
 		}
+		return int(math.Min(math.Log(1-rand.Float64())/logq, float64(len(g.Conns))))
+	}
+	for i := gap(); i < len(g.Conns); i += 1 + gap() {
 		if rand.Float64() < 0.95 {
 			g.Conns[i].Weight = clamp(g.Conns[i].Weight+rand.NormFloat64()*p, -8, 8)
 		} else {
@@ -587,20 +625,37 @@ func Crossover(better, other *Genome, childID int) *Genome {
 			child.Traits[i] = child.Traits[i]*t + other.Traits[i]*(1-t)
 		}
 	}
-	om := make(map[int]ConnGene, len(other.Conns))
-	for _, c := range other.Conns {
-		om[c.Innovation] = c
-	}
-	// A matching gene comes whole from one parent, weight and state: the
-	// classic "disabled in either parent → 75 % disabled" rule ratchets
-	// connections off generation after generation.
-	for i, c := range child.Conns {
-		if oc, ok := om[c.Innovation]; ok && rand.Float64() < 0.5 {
-			child.Conns[i].Weight = oc.Weight
-			child.Conns[i].Enabled = oc.Enabled
+	// The genes are paired by walking both parents' innovation-sorted
+	// caches side by side: a map of the other parent's genes cost more than
+	// the rest of a text-evolution generation once genomes had sixteen
+	// thousand connections.
+	bs, os := better.indexedConns(), other.indexedConns()
+	var only []int // where in other.Conns the genes better lacks sit
+	i := 0
+	for _, o := range os {
+		for i < len(bs) && bs[i].Innovation < o.Innovation {
+			i++
+		}
+		switch {
+		case i < len(bs) && bs[i].Innovation == o.Innovation:
+			// A matching gene comes whole from one parent, weight and
+			// state: the classic "disabled in either parent → 75 %
+			// disabled" rule ratchets connections off generation after
+			// generation.
+			if rand.Float64() < 0.5 {
+				oc := other.Conns[o.Index]
+				child.Conns[bs[i].Index].Weight = oc.Weight
+				child.Conns[bs[i].Index].Enabled = oc.Enabled
+			}
+			i++
+		case i > 0 && bs[i-1].Innovation == o.Innovation:
+			// A second gene of other with an innovation better has.
+		default:
+			only = append(only, o.Index)
 		}
 	}
-	child.importGenes(other)
+	slices.Sort(only)
+	child.importGenes(other, only)
 	return child
 }
 
@@ -608,15 +663,13 @@ func Crossover(better, other *Genome, childID int) *Genome {
 // passed on too, so a child inherits structure from both lineages.
 var ImportRate = 0.25
 
-// importGenes copies some of other's enabled disjoint and excess connections, adding
-// the nodes they need. Node IDs are global, but genomes saved before that had
-// local ones: a gene whose node ID exists here with another type belongs to a
-// different neuron and is skipped.
-func (g *Genome) importGenes(other *Genome) {
-	have := make(map[int]bool, len(g.Conns))
-	for _, c := range g.Conns {
-		have[c.Innovation] = true
-	}
+// importGenes copies some of other's enabled disjoint and excess connections,
+// the ones at the positions only lists, adding the nodes they need. Node IDs
+// are global, but genomes saved before that had local ones: a gene whose node
+// ID exists here with another type belongs to a different neuron and is
+// skipped.
+func (g *Genome) importGenes(other *Genome, only []int) {
+	have := map[int]bool{}
 	types := make(map[int]NodeType, len(g.Nodes))
 	for _, n := range g.Nodes {
 		types[n.ID] = n.Type
@@ -633,7 +686,8 @@ func (g *Genome) importGenes(other *Genome) {
 		t, mine := types[id]
 		return !mine || t == ot
 	}
-	for _, oc := range other.Conns {
+	for _, k := range only {
+		oc := other.Conns[k]
 		if !oc.Enabled || have[oc.Innovation] || rand.Float64() >= ImportRate || !fits(oc.In) || !fits(oc.Out) {
 			continue
 		}
@@ -681,15 +735,35 @@ func Compatibility(a, b *Genome) float64 {
 	return float64(disjoint)/n + 0.4*avgW
 }
 
-// PrepareCompatibility fills the cache Compatibility reads, so that several
-// goroutines may then compare g at once: the cache is otherwise filled on
-// first use, which would be a race between them.
-func (g *Genome) PrepareCompatibility() { g.sortedConns() }
+// PrepareCompatibility fills the cache Compatibility and Crossover read, so
+// that several goroutines may then compare or cross g at once: the cache is
+// otherwise filled on first use, which would be a race between them.
+func (g *Genome) PrepareCompatibility() { g.indexedConns() }
 
-// innWeight is what Compatibility reads of a connection.
+// indexedConns is sortedConns for a reader that follows Index into Conns. A
+// genome whose genes were reordered in place without Mutate would keep a
+// stale cache of the same length, which only blurs a distance but would pair
+// the wrong genes, so a few entries spread over the cache are checked against
+// Conns and the cache is rebuilt if one is off. All of them would cost a
+// fifth of a dense generation; neat itself always drops the cache when it
+// changes the genes.
+func (g *Genome) indexedConns() []innWeight {
+	s := g.sortedConns()
+	for k := 0; k < len(s); k += max(1, len(s)/16) {
+		if e := s[k]; g.Conns[e.Index].Innovation != e.Innovation {
+			g.sorted = nil
+			return g.sortedConns()
+		}
+	}
+	return s
+}
+
+// innWeight is what Compatibility reads of a connection, and where it sits in
+// Conns, which Crossover follows to the whole gene.
 type innWeight struct {
 	Innovation int
 	Weight     float64
+	Index      int
 }
 
 // sortedConns returns the innovations and weights of the connections sorted
@@ -716,19 +790,54 @@ func (g *Genome) sortedConns() []innWeight {
 		keys[i] = uint64(x.Innovation)<<32 | uint64(i)
 	}
 	if small {
-		slices.Sort(keys)
+		sortMostlySorted(keys)
 		for i, k := range keys {
 			x := g.Conns[k&(1<<32-1)]
-			c[i] = innWeight{x.Innovation, x.Weight}
+			c[i] = innWeight{x.Innovation, x.Weight, int(k & (1<<32 - 1))}
 		}
 	} else {
 		for i, x := range g.Conns {
-			c[i] = innWeight{x.Innovation, x.Weight}
+			c[i] = innWeight{x.Innovation, x.Weight, i}
 		}
-		slices.SortFunc(c, func(a, b innWeight) int { return cmp.Compare(a.Innovation, b.Innovation) })
+		slices.SortStableFunc(c, func(a, b innWeight) int { return cmp.Compare(a.Innovation, b.Innovation) })
 	}
 	g.sorted = c
 	return c
+}
+
+// sortMostlySorted sorts keys that are usually in order up to a short tail:
+// genes are appended as they appear, and most get a new, higher innovation.
+// Only the tail is sorted, then merged with the ordered head, so a dense
+// genome of sixteen thousand genes is not sorted from scratch for each child.
+func sortMostlySorted(keys []uint64) {
+	p := 1
+	for p < len(keys) && keys[p-1] <= keys[p] {
+		p++
+	}
+	if p >= len(keys) {
+		return
+	}
+	tail := keys[p:]
+	slices.Sort(tail)
+	if keys[p-1] <= tail[0] {
+		return
+	}
+	head := slices.Clone(keys[:p])
+	i, j, k := 0, 0, 0
+	for i < len(head) && j < len(tail) {
+		// tail[j] is never overwritten before it is read: k = i+j < p+j.
+		if head[i] <= tail[j] {
+			keys[k] = head[i]
+			i++
+		} else {
+			keys[k] = tail[j]
+			j++
+		}
+		k++
+	}
+	for ; i < len(head); i, k = i+1, k+1 {
+		keys[k] = head[i]
+	}
 }
 
 func clamp(v, lo, hi float64) float64 {

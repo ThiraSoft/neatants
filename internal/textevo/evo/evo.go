@@ -289,6 +289,9 @@ func (p *Population) breed(shares []int) []*neat.Genome {
 			jobs = append(jobs, job{parents: parents, id: p.id()})
 		}
 	}
+	// Crossover reads the parents' sorted genes, which are filled on first
+	// use: they must all be there before two children share a parent.
+	parallel(len(p.Genomes), func(i int) { p.Genomes[i].PrepareCompatibility() })
 	children := make([]*neat.Genome, len(jobs))
 	parallel(len(jobs), func(i int) {
 		j := jobs[i]
