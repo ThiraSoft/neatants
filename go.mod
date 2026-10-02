@@ -2,10 +2,13 @@ module github.com/ThiraSoft/neatants
 
 go 1.24.0
 
+godebug randseednop=0
+
 require (
 	github.com/ThiraSoft/golem v0.45.1
 	github.com/hajimehoshi/ebiten/v2 v2.7.8
 	golang.org/x/image v0.28.0
+	gonum.org/v1/gonum v0.17.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -18,5 +21,4 @@ require (
 	golang.org/x/sync v0.15.0 // indirect
 	golang.org/x/sys v0.20.0 // indirect
 	golang.org/x/text v0.26.0 // indirect
-	gonum.org/v1/gonum v0.17.0 // indirect
 )
