@@ -10,6 +10,10 @@ import (
 	"github.com/ThiraSoft/neatants/internal/sim"
 )
 
+// slotsPerWorld sizes the arena so a normal run never grows it: growing
+// allocates on the card under the mutex while every worker waits.
+const slotsPerWorld = 300
+
 // group is a set of worlds whose brains think in one GPU batch.
 type group struct {
 	worlds []*sim.World
@@ -24,7 +28,7 @@ func newGroup(d *vk.Device, worlds []*sim.World) (*group, error) {
 	}
 	inStride := max(sim.AntInputs, sim.MonInputs)
 	outStride := max(sim.AntOutputs, sim.MonOutputs)
-	b, err := gpubrain.New(d, inStride, outStride, max(1, sim.Cfg.ThinkEvery)+1, 256*len(worlds))
+	b, err := gpubrain.New(d, inStride, outStride, max(1, sim.Cfg.ThinkEvery)+1, slotsPerWorld*len(worlds))
 	if err != nil {
 		return nil, err
 	}

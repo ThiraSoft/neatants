@@ -21,7 +21,8 @@ const (
 	usageArena = vk.UsageStorage | vk.UsageTransferDst | vk.UsageTransferSrc
 	slotBytes  = SlotWords * 4
 	noSlot     = math.MaxUint32 // request slot the kernel skips
-	stageStart = 4              // slots the staging buffer holds at first
+	stageStart = 256            // slots the staging buffer holds at first, and keeps (18 MB of host memory)
+	stageQuiet = 1000           // rounds without a burst before a grown staging buffer is given back
 )
 
 // Batch evaluates many networks per dispatch. Each living network keeps a
@@ -53,6 +54,7 @@ type Batch struct {
 	round    int
 	births   []birth           // newborns of this round: slot and staging index
 	lastBorn int               // births of the previous round
+	calm     int               // rounds since a round last needed more than stageStart slots
 	cpuOut   [][]float32       // per request below reqCap, set for networks too big for a slot
 	overflow map[int][]float32 // outputs of the requests past reqCap, under mu
 	count    atomic.Int64      // requests asked this round, overflowing ones included
@@ -159,10 +161,17 @@ func (b *Batch) Open(capacity int) {
 	b.overflow = nil
 }
 
-// shrinkStaging gives the staging buffer back at its starting size once a
-// burst of births is over. It is not in flight at Open.
+// shrinkStaging gives a grown staging buffer back at its starting size once
+// no round has needed more than that for stageQuiet rounds. Reallocating it
+// sooner would make the next burst of births allocate under the mutex while
+// every worker waits. It is not in flight at Open.
 func (b *Batch) shrinkStaging() {
-	if b.stageCap == stageStart || b.stageCap <= 4*b.lastBorn {
+	if b.lastBorn > stageStart {
+		b.calm = 0
+	} else {
+		b.calm++
+	}
+	if b.stageCap == stageStart || b.calm < stageQuiet {
 		return
 	}
 	st, err := b.d.Host(stageStart*slotBytes, vk.UsageTransferSrc)

@@ -289,8 +289,15 @@ func TestConcurrentAddMixed(t *testing.T) {
 // are numbered 1..count without gaps, that a packed network only addresses
 // values below nodes+count, and that its kind words still hold the kind.
 func TestBackCopiesAreDense(t *testing.T) {
-	f := grown(3, 2000).BuildNetwork().Flat()
-	at, count := backCopies(f)
+	// rand.Seed is a no-op in recent Go, so grown is not reproducible and a
+	// given network may have no back edge: draw until one has.
+	var f *neat.Flat
+	var at []uint32
+	var count int
+	for seed := int64(3); count == 0 && seed < 200; seed++ {
+		f = grown(seed, 2000).BuildNetwork().Flat()
+		at, count = backCopies(f)
+	}
 	n := f.Nodes()
 	seen := make([]bool, count+1)
 	for _, a := range at {
