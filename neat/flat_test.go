@@ -1,0 +1,63 @@
+package neat
+
+import (
+	"math/rand"
+	"testing"
+)
+
+// TestFlatMatchesNetwork runs the level-order interpreter and the network
+// side by side: same inputs, bit-identical outputs, cells and weights.
+func TestFlatMatchesNetwork(t *testing.T) {
+	for seed := int64(1); seed <= 5; seed++ {
+		net := bigGenome(seed, 67, 8).BuildNetwork()
+		f := net.Flat()
+		s := f.NewState()
+		r := rand.New(rand.NewSource(seed))
+		for tick := range 200 {
+			in, _ := randomInputs(r, 67)
+			want := net.Activate(in)
+			got := f.Activate(s, in)
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("seed %d tick %d output %d: flat %v, network %v", seed, tick, i, got[i], want[i])
+				}
+			}
+			for i := range net.cell {
+				if s.Cell[i] != net.cell[i] {
+					t.Fatalf("seed %d tick %d cell %d differs", seed, tick, i)
+				}
+			}
+			for k := range net.weight {
+				if s.Weight[k] != net.weight[k] {
+					t.Fatalf("seed %d tick %d weight %d differs", seed, tick, k)
+				}
+			}
+		}
+	}
+}
+
+// TestFlatLevels checks the level invariant the GPU relies on: a forward
+// edge always comes from a lower level, so a level only reads finished nodes.
+func TestFlatLevels(t *testing.T) {
+	f := bigGenome(2, 67, 8).BuildNetwork().Flat()
+	n := int32(f.Nodes())
+	level := make([]int32, n)
+	for l := 0; l+1 < len(f.LevelStart); l++ {
+		for _, ni := range f.Order[f.LevelStart[l]:f.LevelStart[l+1]] {
+			level[ni] = int32(l + 1)
+		}
+	}
+	for _, ni := range f.Order {
+		for g := range int32(NumGates) {
+			slot := ni*int32(NumGates) + g
+			for k := f.Off[slot]; k < f.Off[slot+1]; k++ {
+				if src := f.From[k]; src < n && level[src] >= level[ni] {
+					t.Fatalf("node %d (level %d) reads node %d (level %d) of this tick", ni, level[ni], src, level[src])
+				}
+			}
+		}
+	}
+	if len(f.LevelStart) < 3 {
+		t.Fatalf("only %d levels: the test genome is too shallow", len(f.LevelStart)-1)
+	}
+}
