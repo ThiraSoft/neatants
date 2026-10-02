@@ -225,14 +225,32 @@ func colonyWealth(c *Colony) float64 {
 	return float64(c.Pop) + c.Food/Cfg.AntCost
 }
 
+// actPrey hands Act what Sense prepared for m: the prey to chase (nil when it
+// died since), its distance and the brain outputs (nil without a brain or
+// when m was born during this Act and has no senses yet). It clears m.prey.
+func (w *World) actPrey(m *Monster) (prey *Ant, preyD float64, o []float64) {
+	prey, preyD = m.prey, m.preyD
+	m.prey = nil
+	if m.sensedAt != w.Tick {
+		// Born during this Act: the script alone drives.
+		prey, preyD, _ = w.monsterPrey(m)
+	} else if m.Net != nil {
+		o = m.out[:]
+	}
+	if prey != nil && !prey.Alive {
+		prey = nil
+	}
+	return prey, preyD, o
+}
+
 func (w *World) updateMonsters() {
 	for _, m := range w.Monsters {
 		if !m.Alive {
 			m.prey = nil
 			continue
 		}
-		prey, preyD := m.prey, m.preyD
-		m.prey = nil // a monster that dies below must not keep its prey
+		// Taken first so that a monster dying below does not keep its prey.
+		prey, preyD, o := w.actPrey(m)
 		m.Prev = m.Pos
 		m.Spawn = math.Min(1, m.Spawn+0.02)
 		m.Flash *= 0.85
@@ -278,16 +296,6 @@ func (w *World) updateMonsters() {
 		// the nest even with ants around.
 		var goal Vec2
 		hasGoal := false
-		var o []float64
-		if m.sensedAt != w.Tick {
-			// Born during this Act: no senses yet, the script alone drives.
-			prey, preyD, _ = w.monsterPrey(m)
-		} else if m.Net != nil {
-			o = m.out[:]
-		}
-		if prey != nil && !prey.Alive {
-			prey = nil
-		}
 		chase := prey != nil && (o == nil || o[2] >= 0.5 || m.Target < 0)
 		if chase {
 			goal, hasGoal = prey.Pos, true

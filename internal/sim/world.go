@@ -851,8 +851,7 @@ func (w *World) forMonstersNear(p Vec2, r float64, fn func(m *Monster, d float64
 	}
 }
 
-// --- Main update ---
-
+// minBrainChunk is the smallest slice of brains worth handing to a worker.
 var minBrainChunk = 8
 
 // clockFreq sets the period of World.Clock: about 209 ticks.

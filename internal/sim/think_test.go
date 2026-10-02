@@ -75,3 +75,40 @@ func TestActSkipsTheDead(t *testing.T) {
 		}
 	}
 }
+
+// TestActPreyDropsDeadPrey kills a monster's prey between Sense and Act:
+// the monster must not chase it, and one with no senses this tick gets no
+// brain outputs.
+func TestActPreyDropsDeadPrey(t *testing.T) {
+	w := senseWorld(t, 4, 300)
+	var m *Monster
+	for range 3000 {
+		w.Sense()
+		for _, c := range w.Monsters {
+			if c.Alive && c.prey != nil {
+				m = c
+				break
+			}
+		}
+		if m != nil {
+			break
+		}
+		w.ThinkCPU()
+		w.Act()
+	}
+	if m == nil {
+		t.Fatal("no monster found a prey")
+	}
+	m.prey.Alive = false
+	prey, _, _ := w.actPrey(m)
+	if prey != nil {
+		t.Fatal("actPrey kept a dead prey")
+	}
+	if m.prey != nil {
+		t.Fatal("actPrey left m.prey set")
+	}
+	m.sensedAt = w.Tick - 1
+	if _, _, o := w.actPrey(m); o != nil {
+		t.Fatal("unsensed monster got brain outputs")
+	}
+}

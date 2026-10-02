@@ -27,6 +27,7 @@ type Thought struct {
 	Out []float64
 }
 
+// Update runs a whole tick on the CPU and reports whether it is time to save.
 func (w *World) Update() bool {
 	w.Sense()
 	w.ThinkCPU()
