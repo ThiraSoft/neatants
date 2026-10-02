@@ -3,3 +3,6 @@
 *.tar.gz
 *.log
 /saves/
+/data/
+/runs/
+/neattext

@@ -1,6 +1,6 @@
 module github.com/ThiraSoft/neatants
 
-go 1.23.2
+go 1.24.0
 
 require (
 	github.com/ThiraSoft/golem v0.45.1
@@ -18,4 +18,5 @@ require (
 	golang.org/x/sync v0.15.0 // indirect
 	golang.org/x/sys v0.20.0 // indirect
 	golang.org/x/text v0.26.0 // indirect
+	gonum.org/v1/gonum v0.17.0 // indirect
 )
