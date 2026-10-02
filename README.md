@@ -80,16 +80,16 @@ Flags:
 | `-migrate` | 20000 | ticks between migrations of champions from one world to the next |
 | `-report` | 10s | interval between progress reports |
 | `-gpu` | off | think for every world's brains on the GPU through Vulkan, in batches. Falls back to the CPU without a usable device. Sets `-worlds` to 96 unless you give it |
-| `-groups` | 3 | with `-gpu`, how many batches the worlds are split into, so the CPU steps some groups while the card thinks for another |
+| `-groups` | 16 | with `-gpu`, how many batches the worlds are split into, so the CPU steps some groups while the card thinks for others |
 | `-config` | `config.yml` | configuration file |
 
 With several worlds, every world starts from the same save and evolves on its own goroutine. Each colony's champion periodically sails to the next world, and the saved file merges the best genomes of all worlds. Ctrl+C saves and exits. The game then picks the lineages up from `saves/`.
 
 ### Running on the GPU
 
-`-gpu` needs a Vulkan driver (Mesa RADV, or a vendor driver). There is nothing to compile: golem loads libvulkan at run time, without cgo.
+`-gpu` needs a Vulkan driver (Mesa RADV, or a vendor driver). There is nothing to compile: golem loads libvulkan at run time, without cgo. On a card with compute-only queues (AMD has four), the groups' dispatches run side by side on them.
 
-It pays off with many worlds. On the author's machine (i7-9700K, RX 9070 XT, 5000 ticks), CPU only with 8 worlds runs at x87. With `-gpu` and 96 worlds it reaches about x330. Here xN is the sum over all worlds of simulated ticks per second, divided by 60.
+It pays off with many worlds. On the author's machine (i7-9700K, RX 9070 XT, 5000 ticks), CPU only with 8 worlds runs at x87. With `-gpu` and 96 worlds it reaches about x400 with `think_every: 2`, and about x460 with `think_every: 3`, the default. Here xN is the sum over all worlds of simulated ticks per second, divided by 60.
 
 Networks compute in float32 on both the CPU and the GPU, so a lineage evolved on the GPU behaves the same in the game, give or take float rounding.
 

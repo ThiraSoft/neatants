@@ -12,7 +12,7 @@ ant_vision: 110
 ant_max_age: 36000 # maximum lifespan of an ant in ticks (drawn between half of this and the maximum)
 ant_energy_drain: 0.00012
 ant_hidden: 0 # hidden neurons of new genomes · 0 = minimal NEAT start (inputs wired straight to outputs, structure comes from mutations)
-think_every: 2 # ants think one tick out of N (2 = 30 times per second, 1 = every tick)
+think_every: 3 # ants think one tick out of N (2 = 30 times per second, 1 = every tick)
 threat_range: 130 # distance at which an ant spots the nearest threat (shorter = cheaper to compute)
 selection: colony # colony: half colony success, half individual contribution · advanced: individual contribution only · classic: former selection
 shaping_fade: 1000000 # evolution ticks to fade out the learning rewards (pickup, travel, fights...): afterwards only the colony, deliveries and survival count · 0 = never

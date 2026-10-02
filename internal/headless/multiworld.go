@@ -40,7 +40,9 @@ func runWorlds(worlds []*sim.World, ticks, epoch int, every time.Duration, gpu b
 	var stopped atomic.Bool
 	var sched *scheduler
 	if gpu {
-		d, err := vk.Open()
+		// Compute queues let the groups' dispatches run side by side:
+		// on one queue the card takes them in turn.
+		d, err := vk.OpenWith(vk.Options{ComputeQueues: 4})
 		if err == nil {
 			sched, err = newScheduler(d, worlds, groups, &stopped)
 			if err != nil {

@@ -102,13 +102,17 @@ func (g *group) close() { g.batch.Close() }
 //     (stepWorld). The worker that steps the last world of a group hands the
 //     group to the GPU goroutine through the filled queue, or reports it
 //     drained.
-//   - one GPU goroutine takes the filled groups in order, Starts and Finishes
-//     each, opens its next round and puts all its worlds on the ready queue.
+//   - one GPU goroutine Starts each filled group as soon as it arrives, so the
+//     card runs the dispatches of several groups at once. When a group's
+//     round is finished it opens its next round and puts all its worlds on
+//     the ready queue.
+//   - one waiter goroutine Finishes the started groups in the order they
+//     were started and hands them back to the GPU goroutine.
 //
 // Invariants:
-//   - Only the GPU goroutine calls Start and Finish, so at most one dispatch
-//     is in flight on the device, as vk.Device.Start requires, and a group's
-//     Open comes after its Finish.
+//   - Only the GPU goroutine calls Start, as the device's queue requires, and
+//     only the waiter calls Finish. A group's Open comes after its Finish,
+//     which the done channel orders.
 //   - A world is on the ready queue, or held by one worker, or waiting in a
 //     group the GPU goroutine owns, never two at once: the ready queue is as
 //     big as the worlds, so no send on it ever blocks.
@@ -124,7 +128,7 @@ type scheduler struct {
 	workers int
 
 	// Idle time, in nanoseconds, since the last takeStats: how long the GPU
-	// goroutine waited for a filled group (the card was idle), how long the
+	// goroutine waited with nothing on the card (the card was idle), how long the
 	// workers together waited for a ready world (cores idle), and the time
 	// spent in run.
 	gpuWait, workerWait, wall atomic.Int64
@@ -189,41 +193,62 @@ func (s *scheduler) run(steps int) ([]int, error) {
 			}
 		}()
 	}
+	// started and done are as big as the groups: a group is in at most one of
+	// them, so no send on them ever blocks.
+	started := make(chan *group, len(s.groups))
+	done := make(chan finished, len(s.groups))
+	go func() {
+		for g := range started {
+			done <- finished{g, g.batch.Finish()}
+		}
+		close(done)
+	}()
 	gpu.Add(1)
 	go func() {
 		defer gpu.Done()
+		// On the way out, wait for whatever is still on the card.
+		defer func() {
+			close(started)
+			for range done {
+			}
+		}()
+		inFlight := 0
 		for {
 			t := time.Now()
-			var g *group
 			select {
-			case g = <-filled:
+			case g := <-filled:
+				if inFlight == 0 {
+					s.gpuWait.Add(int64(time.Since(t)))
+				}
+				if err := g.batch.Start(); err != nil {
+					errc <- err
+					return
+				}
+				inFlight++
+				started <- g
+			case f := <-done:
+				inFlight--
+				if f.err != nil {
+					errc <- f.err
+					return
+				}
+				g := f.g
+				// The next round acts once more. The last one of the epoch,
+				// or the first after a stop, only acts.
+				g.acts++
+				g.mode = modeStep
+				if g.acts >= steps || s.stopped.Load() {
+					g.mode = modeDrain
+				} else {
+					g.open()
+				}
+				g.release(ready)
 			case <-quit:
 				return
 			}
-			s.gpuWait.Add(int64(time.Since(t)))
-			err := g.batch.Start()
-			if err == nil {
-				err = g.batch.Finish()
-			}
-			if err != nil {
-				errc <- err
-				return
-			}
-			// The next round acts once more. The last one of the epoch, or
-			// the first after a stop, only acts.
-			g.acts++
-			g.mode = modeStep
-			if g.acts >= steps || s.stopped.Load() {
-				g.mode = modeDrain
-			} else {
-				g.open()
-			}
-			g.release(ready)
 		}
 	}()
 
-	// Open every batch before any dispatch can start, so no buffer is
-	// allocated on the device while another group's dispatch is in flight.
 	for _, g := range s.groups {
 		g.acts, g.mode = 0, modePrime
 		g.open()
@@ -251,6 +276,11 @@ func (s *scheduler) run(steps int) ([]int, error) {
 		ran[i] = g.acts
 	}
 	return ran, err
+}
+
+type finished struct {
+	g   *group
+	err error
 }
 
 type job struct {

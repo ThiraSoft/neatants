@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -28,8 +29,18 @@ func main() {
 	worlds := flag.Int("worlds", runtime.NumCPU(), "worlds evolving in parallel (1 = a single world, brains spread over the cores)")
 	epoch := flag.Int("migrate", 20000, "ticks between two champion migrations from one world to the next")
 	gpu := flag.Bool("gpu", false, "think on the GPU (Vulkan), batching every world's brains")
-	groups := flag.Int("groups", 3, "with -gpu, groups of worlds sharing a GPU batch (more groups keep the cores busier but make smaller dispatches)")
+	groups := flag.Int("groups", 16, "with -gpu, groups of worlds sharing a GPU batch (more groups keep the cores busier but make smaller dispatches)")
+	profile := flag.String("cpuprofile", "", "write a CPU profile of the run to this file")
 	flag.Parse()
+	if *profile != "" {
+		f, err := os.Create(*profile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 	given := false
 	flag.Visit(func(f *flag.Flag) { given = given || f.Name == "worlds" })
 	if *gpu && !given {

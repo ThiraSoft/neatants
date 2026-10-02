@@ -38,8 +38,14 @@ const (
 // filled: Out of round r is valid until round r+2 opens. Everything else
 // (arena, staging, slots) is shared by the two generations, and only one
 // round at a time may be between Open and Finish.
+//
+// Each batch submits on a stream of its own, so the rounds of several batches
+// on one device may be in flight together. Their Start calls still come from
+// one goroutine, as the device's queue requires; Finish only waits on the
+// batch's fence and may run on another.
 type Batch struct {
 	d                   *vk.Device
+	stream              *vk.Stream
 	pipe                *vk.Pipeline
 	arena               *vk.Buffer // Local, capacity*SlotWords words
 	prev                *vk.Buffer // arena before this round's growth, copied into arena by Start
@@ -93,6 +99,10 @@ func New(d *vk.Device, inStride, outStride, ttl, capacity int) (*Batch, error) {
 	b.cur = &b.gens[0]
 	var err error
 	if b.pipe, err = d.NewPipeline(activateSPV, 4, 12); err != nil {
+		return nil, err
+	}
+	if b.stream, err = d.Stream(); err != nil {
+		b.Close()
 		return nil, err
 	}
 	if b.arena, err = d.Local(capacity*slotBytes, usageArena); err != nil {
@@ -175,7 +185,10 @@ func (b *Batch) Open(capacity int) {
 	b.curGen ^= 1
 	b.cur = &b.gens[b.curGen]
 	g := b.cur
-	g.count.Store(0)
+	// The generation's own last round counts too: when the rounds alternate
+	// in size, as staggered thinking makes them, each generation only ever
+	// sees one kind, and the other's count says nothing of its overflow.
+	last = max(last, int(g.count.Swap(0)))
 	b.lastBorn = len(b.births)
 	b.births = b.births[:0]
 	b.shrinkStaging()
@@ -369,16 +382,18 @@ func (b *Batch) Start() error {
 	b.mu.Unlock()
 	copy(g.req.Uints(), g.slots[:b.n])
 	push := [3]uint32{uint32(b.n), uint32(b.inStride), uint32(b.outStride)}
-	return b.d.Start(func(r *vk.Recorder) {
+	// Only copies come before the dispatch, so the barriers wait for
+	// transfers and not for the kernels of other batches still on the card.
+	return b.stream.Start(func(r *vk.Recorder) {
 		if b.prev != nil {
 			r.Copy(b.arena, 0, b.prev, b.prevSize)
-			r.Barrier()
+			r.TransferBarrier()
 		}
 		for _, bi := range b.births {
 			r.CopyFrom(b.arena, int(bi.slot)*slotBytes, b.staging, int(bi.staged)*slotBytes, slotBytes)
 		}
 		if len(b.births) > 0 {
-			r.Barrier()
+			r.TransferBarrier()
 		}
 		if b.n > 0 {
 			r.Dispatch(g.set, uint32(b.n), unsafe.Pointer(&push))
@@ -388,7 +403,7 @@ func (b *Batch) Start() error {
 
 // Finish waits for the dispatch Start began.
 func (b *Batch) Finish() error {
-	err := b.d.Wait()
+	err := b.stream.Wait()
 	if b.prev != nil { // its copy has run
 		b.prev.Close()
 		b.prev = nil
@@ -424,6 +439,9 @@ func (b *Batch) Close() {
 				x.Close()
 			}
 		}
+	}
+	if b.stream != nil {
+		b.stream.Close()
 	}
 	for _, x := range []*vk.Buffer{b.prev, b.arena, b.staging} {
 		if x != nil {

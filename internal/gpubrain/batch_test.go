@@ -473,3 +473,35 @@ func TestOutSurvivesNextRound(t *testing.T) {
 		prevTickets = tickets
 	}
 }
+
+// TestAlternatingRoundsGrowBoth alternates a big round and a small one, as
+// think_every 2 does when one tick has more thinkers than the next. The two
+// generations each see only one kind of round, so the big one must grow from
+// its own overflow and stop overflowing, whatever the small round says.
+func TestAlternatingRoundsGrowBoth(t *testing.T) {
+	d := device(t)
+	b, err := New(d, 72, 8, 3, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	nets := make([]*neat.Network, 40)
+	for i := range nets {
+		nets[i] = neat.NewGenomeWithHidden(i+1, 67, 8, 0).BuildNetwork()
+	}
+	in := make([]float64, 67)
+	for round := range 8 {
+		n := 40
+		if round%2 == 1 {
+			n = 4
+		}
+		b.Open(4)
+		for _, net := range nets[:n] {
+			b.Add(net, in)
+		}
+		run(t, b)
+		if _, _, onCPU := b.Stats(); round >= 2 && onCPU != 0 {
+			t.Fatalf("round %d (%d requests): %d still overflow", round, n, onCPU)
+		}
+	}
+}
