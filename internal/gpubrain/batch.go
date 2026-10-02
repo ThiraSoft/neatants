@@ -4,6 +4,7 @@ package gpubrain
 
 import (
 	_ "embed"
+	"fmt"
 	"math"
 	"sync"
 	"unsafe"
@@ -34,6 +35,8 @@ type Batch struct {
 	pipe                *vk.Pipeline
 	set                 *vk.Set
 	arena               *vk.Buffer // Local, capacity*SlotWords words
+	prev                *vk.Buffer // arena before this round's growth, copied into arena by Start
+	prevSize            int
 	req, in             *vk.Buffer // Host: slot per request, inputs
 	out                 *vk.Buffer // Readback
 	staging             *vk.Buffer // Host: packed newborns of this round
@@ -47,6 +50,7 @@ type Batch struct {
 	lastSeen []int
 	round    int
 	births   []birth     // newborns of this round: slot and staging index
+	lastBorn int         // births of the previous round
 	cpuOut   [][]float32 // per request, set for networks run on the CPU
 	n        int         // requests this round
 
@@ -130,7 +134,9 @@ func (b *Batch) rebuildSet() error {
 func (b *Batch) Begin(n int) {
 	b.round++
 	b.n = n
+	b.lastBorn = len(b.births)
 	b.births = b.births[:0]
+	b.shrinkStaging()
 	b.cpuOut = make([][]float32, n)
 	if n > b.reqCap {
 		if err := b.allocRequests(max(n, 2*b.reqCap)); err != nil {
@@ -139,16 +145,32 @@ func (b *Batch) Begin(n int) {
 	}
 }
 
+// shrinkStaging gives the staging buffer back at its starting size once a
+// burst of births is over. It is not in flight at Begin.
+func (b *Batch) shrinkStaging() {
+	if b.stageCap == stageStart || b.stageCap <= 4*b.lastBorn {
+		return
+	}
+	st, err := b.d.Host(stageStart*slotBytes, vk.UsageTransferSrc)
+	if err != nil {
+		return // keep the big one
+	}
+	b.staging.Close()
+	b.staging = st
+	b.stageCap = stageStart
+}
+
 // Set asks for network net to think about in as request i. It is safe to
 // call from several goroutines for distinct i. A network that is not on the
 // card yet is packed into the staging buffer and given a slot; one that does
 // not fit a slot is run on the CPU right away.
 func (b *Batch) Set(i int, net *neat.Network, in []float64) {
-	slot := uint32(noSlot)
+	if len(in) > b.inStride {
+		panic(fmt.Sprintf("gpubrain: %d inputs for a batch built for %d", len(in), b.inStride))
+	}
+	slot := uint32(net.Tag)
 	if net.Tag < 0 {
 		slot = b.admit(net)
-	} else {
-		slot = uint32(net.Tag)
 	}
 	if slot == noSlot {
 		in32 := make([]float32, len(in))
@@ -157,30 +179,27 @@ func (b *Batch) Set(i int, net *neat.Network, in []float64) {
 		}
 		b.cpuOut[i] = append([]float32(nil), net.Activate(in32)...)
 	} else {
-		b.see(slot)
-		dst := b.in.Floats()[i*b.inStride:]
-		for k, x := range in {
-			dst[k] = float32(x)
+		// Missing inputs read as 0, as on the CPU, so the stale values of
+		// the previous round must not stay.
+		dst := b.in.Floats()[i*b.inStride : (i+1)*b.inStride]
+		for k := range dst {
+			dst[k] = 0
+			if k < len(in) {
+				dst[k] = float32(in[k])
+			}
 		}
 	}
 	b.req.Uints()[i] = slot
 }
 
-// see records that slot was asked for this round. It takes the mutex because
-// another goroutine may be growing the arena, which reallocates lastSeen.
-func (b *Batch) see(slot uint32) {
-	b.mu.Lock()
-	b.lastSeen[slot] = b.round
-	b.mu.Unlock()
-}
-
 // admit gives a newborn a slot, or returns noSlot when the network is too
 // big for one. Everything that touches shared state happens under the mutex.
 func (b *Batch) admit(net *neat.Network) uint32 {
+	f := net.Flat() // reads net only, so outside the mutex
+	big := !fits(f)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	f := net.Flat()
-	if !fits(f) {
+	if big {
 		b.onCPU++
 		return noSlot
 	}
@@ -201,19 +220,22 @@ func (b *Batch) admit(net *neat.Network) uint32 {
 	return uint32(slot)
 }
 
-// growArena doubles the arena. The old slots are copied through the device,
-// which is allowed because Set only runs between Finish and Start.
+// growArena doubles the arena. It must not record on the device: another
+// Batch may have a dispatch in flight on the same one. So the old arena is
+// kept and Start records the copy into the new one. Growing twice in a round
+// drops the intermediate arena, which never held anything.
 func (b *Batch) growArena() {
-	old, oldCap := b.arena, b.capacity
+	oldCap := b.capacity
 	arena, err := b.d.Local(2*oldCap*slotBytes, usageArena)
 	if err != nil {
 		panic("gpubrain: growing the arena: " + err.Error())
 	}
-	if err := b.d.Submit(func(r *vk.Recorder) { r.Copy(arena, 0, old, oldCap*slotBytes) }); err != nil {
-		panic("gpubrain: copying the arena: " + err.Error())
+	if b.prev == nil {
+		b.prev, b.prevSize = b.arena, oldCap*slotBytes
+	} else {
+		b.arena.Close()
 	}
 	b.arena = arena
-	old.Close()
 	if err := b.rebuildSet(); err != nil {
 		panic("gpubrain: rebuilding the set: " + err.Error())
 	}
@@ -238,6 +260,11 @@ func (b *Batch) growStaging() {
 // reusable from the next round, so it can never be handed to a birth that is
 // already staged.
 func (b *Batch) Start() error {
+	for _, slot := range b.req.Uints()[:b.n] {
+		if slot != noSlot {
+			b.lastSeen[slot] = b.round
+		}
+	}
 	b.mu.Lock()
 	for s, net := range b.owner {
 		if net != nil && b.round-b.lastSeen[s] > b.ttl {
@@ -250,6 +277,10 @@ func (b *Batch) Start() error {
 	b.mu.Unlock()
 	push := [3]uint32{uint32(b.n), uint32(b.inStride), uint32(b.outStride)}
 	return b.d.Start(func(r *vk.Recorder) {
+		if b.prev != nil {
+			r.Copy(b.arena, 0, b.prev, b.prevSize)
+			r.Barrier()
+		}
 		for _, bi := range b.births {
 			r.CopyFrom(b.arena, int(bi.slot)*slotBytes, b.staging, int(bi.staged)*slotBytes, slotBytes)
 		}
@@ -263,10 +294,17 @@ func (b *Batch) Start() error {
 }
 
 // Finish waits for the dispatch Start began.
-func (b *Batch) Finish() error { return b.d.Wait() }
+func (b *Batch) Finish() error {
+	err := b.d.Wait()
+	if b.prev != nil { // its copy has run
+		b.prev.Close()
+		b.prev = nil
+	}
+	return err
+}
 
 // Out returns the outputs of request i, valid after Finish. The caller reads
-// only as many as its network has.
+// only as many as its network has. The slice is valid until the next Begin.
 func (b *Batch) Out(i int) []float32 {
 	if b.cpuOut[i] != nil {
 		return b.cpuOut[i]
@@ -279,7 +317,7 @@ func (b *Batch) Close() {
 	if b.set != nil {
 		b.set.Close()
 	}
-	for _, x := range []*vk.Buffer{b.arena, b.req, b.in, b.out, b.staging} {
+	for _, x := range []*vk.Buffer{b.prev, b.arena, b.req, b.in, b.out, b.staging} {
 		if x != nil {
 			x.Close()
 		}
