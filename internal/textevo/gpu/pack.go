@@ -9,22 +9,59 @@ import (
 	"github.com/ThiraSoft/neatants/neat"
 )
 
-// Capacities of the netrun kernel's shared memory; netrun.spv is compiled
-// with the same numbers (see the go:generate line in gen.go).
+// Capacities of the netrun kernel's shared memory. netrun is bound by how
+// many workgroups are in flight, which the shared memory a workgroup takes
+// decides, so it is built twice (see the go:generate lines in gen.go): a
+// small variant just above what the largest champions of the first runs
+// needed (799 values, 197 memory cells, 187 plastic links), which takes
+// about a third of the shared memory of a big one, and the big one for the
+// networks that outgrow it. The Max constants are those of the big one.
 const (
-	MaxNodes   = 2048
 	MaxValues  = 2048
+	MaxNodes   = MaxValues
+	MaxMemory  = 1024
 	MaxPlastic = 1024
+	// LevelEdges is the room for the products of one level, in both; Pack
+	// splits a longer level into several, so only one node's edges must
+	// fit.
+	LevelEdges = 256
+
+	smallValues  = 1024
+	smallMemory  = 256
+	smallPlastic = 256
 )
 
 //go:embed netrun.spv
 var netrunSPV []byte
 
-// Fits reports whether f fits in the shared memory of netrun.
-func Fits(f *neat.Flat) bool {
+//go:embed netrun_big.spv
+var netrunBigSPV []byte
+
+// netClass is the netrun variant f runs in: 0 the small one, 1 the big one,
+// -1 if it fits in neither.
+func netClass(f *neat.Flat) int {
 	_, back := backCopies(f)
-	return f.Nodes() <= MaxNodes && f.Nodes()+back <= MaxValues && len(f.Plastic) <= MaxPlastic
+	mem := 0
+	for _, ni := range f.Order {
+		if f.Kind[ni] == uint8(neat.Memory) {
+			mem++
+		}
+		if f.Off[4*ni+4]-f.Off[4*ni] > LevelEdges {
+			return -1
+		}
+	}
+	values, pl := f.Nodes()+back, len(f.Plastic)
+	switch {
+	case values <= smallValues && mem <= smallMemory && pl <= smallPlastic:
+		return 0
+	case values <= MaxValues && mem <= MaxMemory && pl <= MaxPlastic:
+		return 1
+	}
+	return -1
 }
+
+// Fits reports whether f fits in the shared memory of netrun.
+func Fits(f *neat.Flat) bool { return netClass(f) >= 0 }
 
 // backCopies numbers the nodes whose previous-tick value some edge reads.
 // Flat addresses those values at n+node, 2n floats for n nodes of which only
@@ -48,60 +85,113 @@ func backCopies(f *neat.Flat) (at []uint32, count int) {
 	return at, count
 }
 
+// recordPad zero words end a record, so that the kernel's clamped loads of a
+// network with no edge or no node still read inside it.
+const recordPad = 4
+
+// Order words carry the node, its memory cell and whether it is a memory node.
+const (
+	orderMem       = 1 << 31
+	orderCellShift = 16
+)
+
 // Pack appends the record of f to dst and returns the extended slice. The
 // layout, in words from the start of the record:
 //
 //	n, nOrder, nLevels, nPlastic, inStart, inEnd, outStart, outEnd
 //	kind[n]            kind | backCopy<<8
-//	levelStart[nLevels+1]
-//	order[nOrder]
-//	off[4n+1]          off[4n] is the edge count
+//	level[2(nLevels+1)] first slot and first edge of each level
+//	order[nOrder]      node | cell<<16 | memory<<31, by level
+//	off[4nOrder+1]     per slot and gate, the first edge; the last is the count
 //	edges[2E]          from (bits 0-15 value index, 16-30 plastic index+1), weight bits
 //	plastic[4P]        k, from, to, eta bits
+//	pad[4]             zeros
+//
+// The edges are laid out in the order of the slots, not of the nodes, so that
+// the edges of a level are contiguous: the kernel computes all their products
+// at once, one lane an edge, and each node then adds its own in the order the
+// CPU does. A level with more than LevelEdges edges is split in several,
+// which is still a valid order since nodes of one level never read each
+// other.
 func Pack(dst []uint32, f *neat.Flat) []uint32 {
 	n := f.Nodes()
 	back, _ := backCopies(f)
-	size := 8 + n + len(f.LevelStart) + len(f.Order) + len(f.Off) + 2*len(f.From) + 4*len(f.Plastic)
+	nOrder := len(f.Order)
+	edgesOf := func(ni int32) int { return int(f.Off[4*ni+4] - f.Off[4*ni]) }
+	levels := make([]int32, 1, len(f.LevelStart)+4)
+	for l := 0; l+1 < len(f.LevelStart); l++ {
+		e := 0
+		for j := f.LevelStart[l]; j < f.LevelStart[l+1]; j++ {
+			k := edgesOf(f.Order[j])
+			if e+k > LevelEdges && j > levels[len(levels)-1] {
+				levels = append(levels, j)
+				e = 0
+			}
+			e += k
+		}
+		levels = append(levels, f.LevelStart[l+1])
+	}
+	nLevels := len(levels) - 1
+	nEdges := 0
+	for _, ni := range f.Order {
+		nEdges += edgesOf(ni)
+	}
+	size := 8 + n + 2*(nLevels+1) + nOrder + 4*nOrder + 1 + 2*nEdges + 4*len(f.Plastic) + recordPad
 	// Grow once, then fill by index: appending word by word costs more than
 	// the rest of the record.
 	at := len(dst)
 	dst = slices.Grow(dst, size)[:at+size]
 	w := dst[at:]
-	w[0], w[1], w[2], w[3] = uint32(n), uint32(len(f.Order)), uint32(len(f.LevelStart)-1), uint32(len(f.Plastic))
+	w[0], w[1], w[2], w[3] = uint32(n), uint32(nOrder), uint32(nLevels), uint32(len(f.Plastic))
 	w[4], w[5], w[6], w[7] = uint32(f.InStart), uint32(f.InEnd), uint32(f.OutStart), uint32(f.OutEnd)
-	i := 8
+	kindOff := 8
+	levelOff := kindOff + n
+	orderOff := levelOff + 2*(nLevels+1)
+	offOff := orderOff + nOrder
+	edgeOff := offOff + 4*nOrder + 1
+	plOff := edgeOff + 2*nEdges
 	for j, k := range f.Kind {
-		w[i+j] = uint32(k) | back[j]<<8
+		w[kindOff+j] = uint32(k) | back[j]<<8
 	}
-	i += n
-	for j, x := range f.LevelStart {
-		w[i+j] = uint32(x)
+	// moved[k] is where edge k of f lands.
+	moved := make([]int32, len(f.From))
+	for i := range moved {
+		moved[i] = -1
 	}
-	i += len(f.LevelStart)
-	for j, x := range f.Order {
-		w[i+j] = uint32(x)
-	}
-	i += len(f.Order)
-	for j, x := range f.Off {
-		w[i+j] = uint32(x)
-	}
-	i += len(f.Off)
-	edges := i
-	for j, x := range f.From {
-		if int(x) >= n { // a back edge reads the copy, which sits after the n values
-			x = int32(n) + int32(back[int(x)-n]) - 1
+	cur, cell := 0, uint32(0)
+	for j, ni := range f.Order {
+		ow := uint32(ni)
+		if f.Kind[ni] == uint8(neat.Memory) {
+			ow |= orderMem | cell<<orderCellShift
+			cell++
 		}
-		w[i+2*j] = uint32(x)
-		w[i+2*j+1] = math.Float32bits(f.Weight[j])
+		w[orderOff+j] = ow
+		for g := range 4 {
+			w[offOff+4*j+g] = uint32(cur)
+			for k := f.Off[4*int(ni)+g]; k < f.Off[4*int(ni)+g+1]; k++ {
+				x := f.From[k]
+				if int(x) >= n { // a back edge reads the copy, which sits after the n values
+					x = int32(n) + int32(back[int(x)-n]) - 1
+				}
+				w[edgeOff+2*cur] = uint32(x)
+				w[edgeOff+2*cur+1] = math.Float32bits(f.Weight[k])
+				moved[k] = int32(cur)
+				cur++
+			}
+		}
 	}
-	i += 2 * len(f.From)
+	w[offOff+4*nOrder] = uint32(cur)
+	for i, s := range levels {
+		w[levelOff+2*i] = uint32(s)
+		w[levelOff+2*i+1] = w[offOff+4*int(s)]
+	}
 	for p, pl := range f.Plastic {
-		w[edges+2*int(pl.K)] |= uint32(p+1) << 16
+		k := moved[pl.K]
+		w[edgeOff+2*int(k)] |= uint32(p+1) << 16
+		i := plOff + 4*p
+		w[i], w[i+1], w[i+2], w[i+3] = uint32(k), uint32(pl.From), uint32(pl.To), math.Float32bits(pl.Eta)
 	}
-	for _, p := range f.Plastic {
-		w[i], w[i+1], w[i+2], w[i+3] = uint32(p.K), uint32(p.From), uint32(p.To), math.Float32bits(p.Eta)
-		i += 4
-	}
+	clear(w[size-recordPad:])
 	return dst
 }
 

@@ -4,13 +4,32 @@
 // memory from the first tick to the last, so a generation is one dispatch and
 // the only global writes are the output vectors of the scored ticks. Each
 // tick computes exactly what neat.Flat.Activate computes.
+//
+// Grown networks are deep and narrow (the champions of the first runs have
+// about eighty levels of two to ten nodes), so a level is done in two steps:
+// every lane takes one edge of the level and stores its product, then every
+// lane takes one node and adds up the products of its edges in the order of
+// the CPU. The long serial walk over a node's edges in global memory becomes
+// one load per lane and a short walk in shared memory.
+//
+// What limits the speed is how many workgroups are in flight, which the
+// shared memory a workgroup takes decides, so the capacities are kept small
+// (see pack.go) and a workgroup is a single wave, for which a barrier is
+// almost free.
 
 #ifndef LANES
-#define LANES 256u
+#define LANES 64u
 #endif
 layout(local_size_x = LANES) in;
 
 #include "neatmath.glsl"
+#extension GL_KHR_shader_subgroup_basic : require
+
+#ifdef SGBAR
+#define BAR() { subgroupMemoryBarrierShared(); subgroupBarrier(); }
+#else
+#define BAR() barrier()
+#endif
 
 // gen: [starts K][scale G][goff G][records], see pack.go.
 layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
@@ -26,15 +45,82 @@ layout(push_constant) uniform Push {
 	uint dim;
 	uint startsOff;
 	uint goffOff;
+	uint listOff;
 } pc;
 
 shared float v[MAX_VALUES];
-shared float cell[MAX_NODES];
+shared float cell[MAX_MEMORY];
 shared float pw[MAX_PLASTIC];
+shared float prod[LEVEL_EDGES];
+
+#ifndef SUMW
+#define SUMW 4u
+#endif
+// sumProd adds prod[a..b) in order, as the CPU does, but reads SUMW products
+// at once: a read of shared memory takes many cycles, and one at a time they
+// would follow each other.
+float sumProd(uint a, uint b) {
+	precise float s = 0.0;
+	uint k = a;
+	for (; k + SUMW <= b; k += SUMW) {
+		float x[SUMW];
+		for (uint u = 0u; u < SUMW; u++) x[u] = prod[k + u];
+		for (uint u = 0u; u < SUMW; u++) s = s + x[u];
+	}
+	for (; k < b; k++) s = s + prod[k];
+	return s;
+}
+
+// Pre holds what a lane loads ahead for a level: its first edge and the
+// order word and gate offsets of its first node.
+struct Pre {
+	uint fw, wb, ow, o4;
+	uvec4 of;
+};
+
+// fetch loads them whether the lane has an edge or a node in the level or
+// not, at a clamped index: a load under a branch would leave the compiler
+// unsure how many loads are in flight, and it would then wait for all of them
+// before the first use, the prefetched ones included.
+Pre fetch(uvec4 lb, uint lane, uint lastE, uint lastJ, uint edgeOff, uint orderOff, uint offOff) {
+	uint k = min(lb.y + lane, lastE), j = min(lb.x + lane, lastJ);
+	uint gb = offOff + 4u * j;
+	return Pre(gw[edgeOff + 2u * k], gw[edgeOff + 2u * k + 1u], gw[orderOff + j], gw[gb + 4u],
+		uvec4(gw[gb], gw[gb + 1u], gw[gb + 2u], gw[gb + 3u]));
+}
+
+// edge stores the product of one edge, k counted from the first of its level.
+void edge(uint k, uint fw, uint wb) {
+	uint pl = (fw >> 16) & 0x7FFFu;
+	float wt = pl != 0u ? pw[pl - 1u] : uintBitsToFloat(wb);
+	precise float x = v[fw & 0xFFFFu] * wt;
+	prod[k] = x;
+}
+
+// node computes one node from the products of its level, its offsets
+// counted from the first edge of the level.
+void node(uint ow, uvec4 of, uint o4) {
+	uint ni = ow & 0xFFFFu;
+	float s0 = sumProd(of.x, of.y);
+	if ((ow & 0x80000000u) == 0u) {
+		v[ni] = sig(s0);
+	} else {
+		float s1 = sumProd(of.y, of.z), s2 = sumProd(of.z, of.w), s3 = sumProd(of.w, o4);
+		uint ci = (ow >> 16) & 0x7FFFu;
+		precise float ig = sig01(s1 + 2.0);
+		precise float fg = sig01(s2 + 2.0);
+		precise float og = sig01(s3 + 2.0);
+		precise float c = fg * cell[ci] + ig * fast_tanh(s0);
+		cell[ci] = c;
+		precise float y = og * fast_tanh(c);
+		v[ni] = y;
+	}
+}
 
 void main() {
-	uint p = gl_WorkGroupID.x;
-	if (p >= pc.pairs) return;
+	if (gl_WorkGroupID.x >= pc.pairs) return;
+	// The pairs of this variant are listed, see layoutInto.
+	uint p = gw[pc.listOff + gl_WorkGroupID.x];
 	uint lane = gl_LocalInvocationID.x;
 	uint g = p / pc.windows, w = p % pc.windows;
 	uint b = gw[pc.goffOff + g];
@@ -42,21 +128,20 @@ void main() {
 	uint inStart = gw[b + 4u], inEnd = gw[b + 5u], outStart = gw[b + 6u];
 	uint kindOff = b + 8u;
 	uint levelOff = kindOff + n;
-	uint orderOff = levelOff + nLevels + 1u;
+	uint orderOff = levelOff + 2u * (nLevels + 1u);
 	uint offOff = orderOff + nOrder;
-	uint nEdges = gw[offOff + 4u * n];
-	uint edgeOff = offOff + 4u * n + 1u;
+	uint nEdges = gw[offOff + 4u * nOrder];
+	uint edgeOff = offOff + 4u * nOrder + 1u;
 	uint plOff = edgeOff + 2u * nEdges;
+	uint lastE = max(nEdges, 1u) - 1u, lastJ = max(nOrder, 1u) - 1u;
 	uint start = gw[pc.startsOff + w];
 	uint scored = pc.len - pc.warm;
 	uint hd = pc.dim / 2u;
 
-	for (uint i = lane; i < n; i += LANES) {
-		v[i] = 0.0;
-		cell[i] = 0.0;
-	}
+	for (uint i = lane; i < n; i += LANES) v[i] = 0.0;
+	for (uint i = lane; i < MAX_MEMORY; i += LANES) cell[i] = 0.0;
 	for (uint q = lane; q < nPlastic; q += LANES) pw[q] = uintBitsToFloat(gw[edgeOff + 2u * gw[plOff + 4u * q] + 1u]);
-	barrier();
+	BAR();
 
 	for (uint t = 0u; t < pc.len; t++) {
 		uint row = tokens[start + t] * pc.dim;
@@ -70,40 +155,42 @@ void main() {
 			uint back = gw[kindOff + x] >> 8;
 			if (back != 0u) v[n + back - 1u] = y;
 		}
-		barrier();
+		BAR();
 
+		// The loads of a level do not depend on any product, so those of the
+		// first edge and the first node of each lane are asked for one level
+		// ahead, and arrive while the level before is being computed.
+		uvec4 lb = uvec4(gw[levelOff], gw[levelOff + 1u], gw[levelOff + 2u], gw[levelOff + 3u]);
+		uvec4 lbn = uvec4(0u);
+		if (nLevels > 1u) lbn = uvec4(lb.z, lb.w, gw[levelOff + 4u], gw[levelOff + 5u]);
+#ifdef NOLEVEL
+		nLevels = 0u;
+#endif
+		Pre cur = fetch(lb, lane, lastE, lastJ, edgeOff, orderOff, offOff);
 		for (uint l = 0u; l < nLevels; l++) {
-			uint s = gw[levelOff + l], e = gw[levelOff + l + 1u];
-			for (uint j = s + lane; j < e; j += LANES) {
-				uint ni = gw[orderOff + j];
-				uint gb = offOff + ni * 4u;
-				bool mem = (gw[kindOff + ni] & 0xFFu) == MEMORY;
-				uint o0 = gw[gb], o1 = gw[gb + 1u], o2 = gw[gb + 2u], o3 = gw[gb + 3u], o4 = gw[gb + 4u];
-				precise float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-				uint end = mem ? o4 : o1;
-				for (uint k = o0; k < end; k++) {
-					uint fw = gw[edgeOff + 2u * k];
-					uint pl = (fw >> 16) & 0x7FFFu;
-					float wt = pl != 0u ? pw[pl - 1u] : uintBitsToFloat(gw[edgeOff + 2u * k + 1u]);
-					precise float prod = v[fw & 0xFFFFu] * wt;
-					if (k < o1) s0 = s0 + prod;
-					else if (k < o2) s1 = s1 + prod;
-					else if (k < o3) s2 = s2 + prod;
-					else s3 = s3 + prod;
-				}
-				if (!mem) {
-					v[ni] = sig(s0);
-				} else {
-					precise float ig = sig01(s1 + 2.0);
-					precise float fg = sig01(s2 + 2.0);
-					precise float og = sig01(s3 + 2.0);
-					precise float c = fg * cell[ni] + ig * fast_tanh(s0);
-					cell[ni] = c;
-					precise float y = og * fast_tanh(c);
-					v[ni] = y;
+			Pre nxt = fetch(lbn, lane, lastE, lastJ, edgeOff, orderOff, offOff);
+			uvec4 lbnn = uvec4(0u);
+			if (l + 2u < nLevels) lbnn = uvec4(lbn.z, lbn.w, gw[levelOff + 2u * (l + 3u)], gw[levelOff + 2u * (l + 3u) + 1u]);
+			uint s = lb.x, es = lb.y, e = lb.z, ee = lb.w;
+			// Most levels have fewer edges and nodes than lanes, and then
+			// the prefetched ones are all there is; the others load the
+			// rest on the spot.
+			if (es + lane < ee) edge(lane, cur.fw, cur.wb);
+			if (ee - es > LANES) {
+				for (uint k = es + lane + LANES; k < ee; k += LANES) edge(k - es, gw[edgeOff + 2u * k], gw[edgeOff + 2u * k + 1u]);
+			}
+			BAR();
+			if (s + lane < e) node(cur.ow, cur.of - es, cur.o4 - es);
+			if (e - s > LANES) {
+				for (uint j = s + lane + LANES; j < e; j += LANES) {
+					uint gb = offOff + 4u * j;
+					node(gw[orderOff + j], uvec4(gw[gb], gw[gb + 1u], gw[gb + 2u], gw[gb + 3u]) - es, gw[gb + 4u] - es);
 				}
 			}
-			barrier();
+			BAR();
+			lb = lbn;
+			lbn = lbnn;
+			cur = nxt;
 		}
 
 		if (t >= pc.warm) {
@@ -121,6 +208,6 @@ void main() {
 			precise float nw = wq + eta * post * (pre - post * wq);
 			pw[q] = clamp(nw, -8.0, 8.0);
 		}
-		barrier();
+		BAR();
 	}
 }

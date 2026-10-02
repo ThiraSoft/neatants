@@ -1,7 +1,10 @@
 package gpu
 
 import (
+	"encoding/json"
 	"math/rand"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -84,3 +87,86 @@ func BenchmarkPop200(b *testing.B)  { benchPop(b, 200, grown, "") }
 func BenchmarkPop500(b *testing.B)  { benchPop(b, 500, grown, "") }
 func BenchmarkPop1000(b *testing.B) { benchPop(b, 1000, grown, "") }
 func BenchmarkPop2000(b *testing.B) { benchPop(b, 2000, grown, "") }
+
+// realChampion is the best genome of the first pop-200 run (runs/ is not in
+// git): 776 nodes, about 2400 edges, 197 memory cells, 187 plastic links at
+// its last generation. Without the file, bigGrown builds one of that size.
+var realChampion = sync.OnceValue(func() *neat.Genome {
+	raw, err := os.ReadFile("../../../runs/first-p200/champion.json")
+	if err != nil {
+		return nil
+	}
+	var c struct {
+		Genome *neat.Genome `json:"genome"`
+	}
+	if json.Unmarshal(raw, &c) != nil || c.Genome == nil {
+		return nil
+	}
+	return c.Genome
+})
+
+// bigGrown grows a genome to the size of the champions of the first runs by
+// mutating it with structural rates raised far above the defaults.
+func bigGrown(seed int64, dim int) *neat.Genome {
+	add, mem, rm, hebb := neat.AddNodeRate, neat.AddMemoryRate, neat.RemoveNodeRate, neat.HebbRate
+	defer func() { neat.AddNodeRate, neat.AddMemoryRate, neat.RemoveNodeRate, neat.HebbRate = add, mem, rm, hebb }()
+	neat.AddNodeRate, neat.AddMemoryRate, neat.RemoveNodeRate, neat.HebbRate = 0.4, 0.2, 0, 1
+	g := model.NewGenome(int(seed), dim)
+	for len(g.Nodes) < 1+2*dim+500 {
+		g.Mutate()
+	}
+	return g
+}
+
+// realistic is a population at the size real runs reach: mutated copies of
+// the real champion, or of one big grown genome when the file is missing.
+func realistic(i, dim int) *neat.Genome {
+	base := realChampion()
+	if base == nil || base.NumInputs != dim {
+		base = bigGenome(dim)
+	}
+	g := base.Copy()
+	g.ID = i + 1
+	for range 3 {
+		g.Mutate()
+	}
+	return g
+}
+
+var bigGenome = func() func(dim int) *neat.Genome {
+	var once sync.Once
+	var g *neat.Genome
+	return func(dim int) *neat.Genome {
+		once.Do(func() { g = bigGrown(1, dim) })
+		return g
+	}
+}()
+
+// Realistic genomes at the two population sizes of the first runs, the
+// whole generation and each kernel alone.
+func BenchmarkRealPop200(b *testing.B)   { benchPop(b, 200, realistic, "") }
+func BenchmarkRealPop1000(b *testing.B)  { benchPop(b, 1000, realistic, "") }
+func BenchmarkRealNet200(b *testing.B)   { benchPop(b, 200, realistic, "net") }
+func BenchmarkRealNet1000(b *testing.B)  { benchPop(b, 1000, realistic, "net") }
+func BenchmarkRealXent1000(b *testing.B) { benchPop(b, 1000, realistic, "xent") }
+func BenchmarkRealNone1000(b *testing.B) { benchPop(b, 1000, realistic, "none") }
+func BenchmarkBigGrownPop1000(b *testing.B) {
+	benchPop(b, 1000, func(i, dim int) *neat.Genome { g := bigGenome(dim).Copy(); g.ID = i + 1; g.Mutate(); return g }, "")
+}
+
+// TestRealisticSizes reports what the realistic benchmarks run.
+func TestRealisticSizes(t *testing.T) {
+	for name, g := range map[string]*neat.Genome{"champion": realChampion(), "bigGrown": bigGrown(1, 128)} {
+		if g == nil {
+			continue
+		}
+		f := g.BuildNetwork().Flat()
+		mem := 0
+		for _, k := range f.Kind {
+			if k == uint8(neat.Memory) {
+				mem++
+			}
+		}
+		t.Logf("%s: %d nodes, %d edges, %d memory, %d plastic, %d levels, fits %v", name, f.Nodes(), len(f.From), mem, len(f.Plastic), len(f.LevelStart)-1, Fits(f))
+	}
+}

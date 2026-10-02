@@ -23,7 +23,9 @@ type Evaluator struct {
 	d    *vk.Device
 	data *prep.Data
 
-	netPipe, xentPipe *vk.Pipeline
+	// netPipe holds the small and the big variant of netrun.
+	netPipe  [2]*vk.Pipeline
+	xentPipe *vk.Pipeline
 	// Resident inputs. Train and validation tokens differ, the embedding is
 	// shared, in float for netrun and in halves for xent.
 	tokens       [2]*vk.Buffer
@@ -36,7 +38,8 @@ type Evaluator struct {
 	up, gen, rows, bits *vk.Buffer
 	capUp, capGen       int
 	capRows, capBits    int
-	netSet, xentSet     [2]*vk.Set
+	netSet              [2][2]*vk.Set // [tokens][variant]
+	xentSet             [2]*vk.Set
 
 	// Timing is how the last Evaluate or Validate spent its time: packing the
 	// genomes on the CPU, the upload and the kernels, summing the bits.
@@ -88,7 +91,7 @@ func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
 	if e.prior, err = upload(d, floats(data.Prior()), vk.UsageStorage); err != nil {
 		return nil, err
 	}
-	if e.netPipe, err = d.NewPipeline(netrunSPV, 4, 7*4); err != nil {
+	if e.netPipe, err = newNetPipes(d); err != nil {
 		return nil, err
 	}
 	// The matrix cores take xent when the device has them and the embedding is
@@ -129,12 +132,12 @@ func packHalves(x []float32) []uint32 {
 // Close releases the sets, the pipelines and every buffer.
 func (e *Evaluator) Close() {
 	e.dropSets()
-	for _, p := range []*vk.Pipeline{e.netPipe, e.xentPipe} {
+	for _, p := range []*vk.Pipeline{e.netPipe[0], e.netPipe[1], e.xentPipe} {
 		if p != nil {
 			p.Close()
 		}
 	}
-	e.netPipe, e.xentPipe = nil, nil
+	e.netPipe, e.xentPipe = [2]*vk.Pipeline{}, nil
 	for _, b := range []*vk.Buffer{e.tokens[0], e.tokens[1], e.emb32, e.emb16, e.prior, e.up, e.gen, e.rows, e.bits} {
 		if b != nil {
 			b.Close()
@@ -146,9 +149,11 @@ func (e *Evaluator) Close() {
 
 func (e *Evaluator) dropSets() {
 	for i := range e.netSet {
-		if e.netSet[i] != nil {
-			e.netSet[i].Close()
-			e.netSet[i] = nil
+		for c := range e.netSet[i] {
+			if e.netSet[i][c] != nil {
+				e.netSet[i][c].Close()
+				e.netSet[i][c] = nil
+			}
 		}
 		if e.xentSet[i] != nil {
 			e.xentSet[i].Close()
@@ -194,8 +199,10 @@ func (e *Evaluator) grow(upBytes, genBytes, rowBytes, bitBytes int) error {
 	}
 	for i := range e.netSet {
 		var err error
-		if e.netSet[i], err = e.netPipe.NewSet([]*vk.Buffer{e.gen, e.tokens[i], e.emb32, e.rows}); err != nil {
-			return err
+		for c := range e.netSet[i] {
+			if e.netSet[i][c], err = e.netPipe[c].NewSet([]*vk.Buffer{e.gen, e.tokens[i], e.emb32, e.rows}); err != nil {
+				return err
+			}
 		}
 		if e.xentSet[i], err = e.xentPipe.NewSet([]*vk.Buffer{e.gen, e.tokens[i], e.emb16, e.rows, e.bits, e.prior}); err != nil {
 			return err
@@ -229,6 +236,7 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 	slots := e.pack(gs, kind == 0)
 	bpb := make([]float64, len(gs))
 	var recs [][]uint32
+	var class []int8
 	var fitIdx []int
 	var scales []float32
 	over := 0
@@ -239,6 +247,7 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 			continue
 		}
 		recs = append(recs, slots[i].rec)
+		class = append(class, slots[i].class)
 		fitIdx = append(fitIdx, i)
 		scales = append(scales, model.LogitScale(gs[i], d.Dim))
 	}
@@ -265,18 +274,16 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 	}
 	// The records go straight into the staging buffer.
 	up := unsafe.Slice((*uint32)(unsafe.Pointer(&e.up.Bytes()[0])), genBytes/4)
-	gen := layoutInto(up, recs, scales, starts)
+	gen := layoutInto(up, recs, class, scales, starts)
 	e.Timing.Pack = time.Since(start)
 	start = time.Now()
-	netPush := [7]uint32{uint32(pairs), uint32(len(starts)), uint32(length), uint32(warm), uint32(d.Dim),
-		uint32(gen.startsOff), uint32(gen.goffOff)}
 	xp := xentPush{uint32(rows), uint32(d.Vocab()), uint32(d.Dim), uint32(scored), uint32(len(starts)), uint32(warm),
 		uint32(gen.startsOff), uint32(gen.scaleOff)}
 	err := e.d.Submit(func(r *vk.Recorder) {
 		r.Copy(e.gen, 0, e.up, genBytes)
 		r.TransferBarrier()
 		if !e.skipNet {
-			r.Dispatch(e.netSet[kind], uint32(pairs), unsafe.Pointer(&netPush))
+			recordNet(r, e.netSet[kind], gen, len(starts), length, warm, d.Dim)
 			r.Barrier()
 		}
 		if !e.skipXent {
@@ -318,6 +325,7 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 type packed struct {
 	rec     []uint32
 	fits    bool
+	class   int8
 	nodes   []neat.NodeGene
 	conns   []neat.ConnGene
 	inputs  int
@@ -356,11 +364,12 @@ func (e *Evaluator) pack(gs []*neat.Genome, cache bool) []packed {
 			s.inputs, s.outputs = g.NumInputs, g.NumOutputs
 		}
 		if p := prev[g.Origin]; g.Origin > 0 && p != nil && p.same(g) {
-			s.fits, s.rec = p.fits, append(s.rec[:0], p.rec...)
+			s.fits, s.class, s.rec = p.fits, p.class, append(s.rec[:0], p.rec...)
 			return
 		}
 		f := g.BuildNetwork().Flat()
-		if s.fits = Fits(f); s.fits {
+		s.class = int8(netClass(f))
+		if s.fits = s.class >= 0; s.fits {
 			s.rec = Pack(s.rec[:0], f)
 		} else {
 			s.rec = s.rec[:0]

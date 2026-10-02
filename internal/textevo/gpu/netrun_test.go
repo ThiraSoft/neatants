@@ -66,18 +66,20 @@ func runNetrun(dev *vk.Device, d *prep.Data, gs []*neat.Genome, starts []int, le
 	}
 	defer out.Close()
 
-	pipe, err := dev.NewPipeline(netrunSPV, 4, 7*4)
+	pipes, err := newNetPipes(dev)
 	if err != nil {
 		return nil, err
 	}
-	set, err := pipe.NewSet([]*vk.Buffer{genB, tokB, embB, rowsB})
-	if err != nil {
-		return nil, err
+	var sets [2]*vk.Set
+	for c, pipe := range pipes {
+		defer pipe.Close()
+		if sets[c], err = pipe.NewSet([]*vk.Buffer{genB, tokB, embB, rowsB}); err != nil {
+			return nil, err
+		}
+		defer sets[c].Close()
 	}
-	push := [7]uint32{uint32(pairs), uint32(len(starts)), uint32(length), uint32(warm), uint32(d.Dim),
-		uint32(gen.startsOff), uint32(gen.goffOff)}
 	err = dev.Submit(func(r *vk.Recorder) {
-		r.Dispatch(set, uint32(pairs), unsafe.Pointer(&push))
+		recordNet(r, sets, gen, len(starts), length, warm, d.Dim)
 		r.Barrier()
 		r.Copy(out, 0, rowsB, size)
 	})
@@ -130,6 +132,84 @@ func TestNetrunMatchesCPU(t *testing.T) {
 	}
 	t.Logf("worst difference %g", worst)
 	// fp16 rows: a half has 11 bits of mantissa, about 5e-4 at 1.
+	if worst > 2e-3 {
+		t.Fatalf("worst difference %g", worst)
+	}
+}
+
+// Levels longer than LevelEdges are split by Pack: the run must stay the
+// network's.
+func TestNetrunSplitLevels(t *testing.T) {
+	dev := device(t)
+	const D = 300
+	d := model.Synthetic(300, D, 2000, 3)
+	var gs []*neat.Genome
+	for i := range 4 {
+		g := model.Grown(int64(i), D, 100*i)
+		if !Fits(g.BuildNetwork().Flat()) {
+			t.Fatalf("genome %d does not fit", i)
+		}
+		gs = append(gs, g)
+	}
+	starts := []int{0, 900}
+	const L, W = 48, 16
+	rows, err := runNetrun(dev, d, gs, starts, L, W)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worst := 0.0
+	for gi, g := range gs {
+		for wi, s := range starts {
+			want := ref.Rows(g, d, d.Train, s, L, W)
+			for ti := range want {
+				for j := range want[ti] {
+					worst = math.Max(worst, math.Abs(float64(rows[gi][wi][ti][j]-want[ti][j])))
+				}
+			}
+		}
+	}
+	t.Logf("worst difference %g", worst)
+	if worst > 2e-3 {
+		t.Fatalf("worst difference %g", worst)
+	}
+}
+
+// Networks past the small variant run in the big one, next to small ones in
+// the same generation, and both give the network's rows.
+func TestNetrunBigVariant(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 32, 2000, 4)
+	var gs []*neat.Genome
+	for i := range 6 {
+		g := model.Grown(int64(i), 32, 100)
+		if i%2 == 1 {
+			for range smallMemory + 20 {
+				g.AddMemory()
+			}
+		}
+		if c, want := netClass(g.BuildNetwork().Flat()), i%2; c != want {
+			t.Fatalf("genome %d runs in variant %d, want %d", i, c, want)
+		}
+		gs = append(gs, g)
+	}
+	starts := []int{0, 500, 1300}
+	const L, W = 48, 16
+	rows, err := runNetrun(dev, d, gs, starts, L, W)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worst := 0.0
+	for gi, g := range gs {
+		for wi, s := range starts {
+			want := ref.Rows(g, d, d.Train, s, L, W)
+			for ti := range want {
+				for j := range want[ti] {
+					worst = math.Max(worst, math.Abs(float64(rows[gi][wi][ti][j]-want[ti][j])))
+				}
+			}
+		}
+	}
+	t.Logf("worst difference %g", worst)
 	if worst > 2e-3 {
 		t.Fatalf("worst difference %g", worst)
 	}
