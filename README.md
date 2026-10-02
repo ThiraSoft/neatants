@@ -44,7 +44,7 @@ Learning rewards (picking food up, progress toward home, fighting) fade over `sh
 
 ## Requirements
 
-- Go 1.22 or newer (see `go.mod`)
+- Go 1.23 or newer (see `go.mod`)
 - For the game window, Ebiten's system dependencies. On Linux you need a C toolchain, OpenGL, X11 and ALSA headers. See the [Ebiten install guide](https://ebitengine.org/en/documents/install.html) for your distribution.
 - The headless runner does not open a window.
 
@@ -68,6 +68,7 @@ Game keys: Space pause, 1 to 5 speed, U turbo (simulate flat out, the window sho
 make evolve               # one world per CPU core, until Ctrl+C
 make evolve WORLDS=1      # a single world
 ./neatants-headless -ticks 2000000
+./neatants-headless -gpu  # 96 worlds, brains thinking on the GPU
 ```
 
 Flags:
@@ -78,9 +79,19 @@ Flags:
 | `-worlds` | number of CPUs | worlds evolving in parallel. With 1, a single world spreads brain computation over cores |
 | `-migrate` | 20000 | ticks between migrations of champions from one world to the next |
 | `-report` | 10s | interval between progress reports |
+| `-gpu` | off | think for every world's brains on the GPU through Vulkan, in batches. Falls back to the CPU without a usable device. Sets `-worlds` to 96 unless you give it |
+| `-groups` | 3 | with `-gpu`, how many batches the worlds are split into, so the CPU steps some groups while the card thinks for another |
 | `-config` | `config.yml` | configuration file |
 
 With several worlds, every world starts from the same save and evolves on its own goroutine. Each colony's champion periodically sails to the next world, and the saved file merges the best genomes of all worlds. Ctrl+C saves and exits. The game then picks the lineages up from `saves/`.
+
+### Running on the GPU
+
+`-gpu` needs a Vulkan driver (Mesa RADV, or a vendor driver). There is nothing to compile: golem loads libvulkan at run time, without cgo.
+
+It pays off with many worlds. On the author's machine (i7-9700K, RX 9070 XT, 5000 ticks), CPU only with 8 worlds runs at x87. With `-gpu` and 96 worlds it reaches about x330. Here xN is the sum over all worlds of simulated ticks per second, divided by 60.
+
+Networks compute in float32 on both the CPU and the GPU, so a lineage evolved on the GPU behaves the same in the game, give or take float rounding.
 
 ## Configuration
 
@@ -104,6 +115,7 @@ neat/                    NEAT genomes, networks, crossover, speciation distance
 internal/sim/            the simulation (no Ebiten)
 internal/render/         Ebiten rendering, HUD, shaders
 internal/headless/       multi-world headless runner
+internal/gpubrain/       GPU brain evaluator: compute kernel, arena of network slots, batches
 config.yml               default configuration
 saves/                   saved lineages (git-ignored)
 ```
