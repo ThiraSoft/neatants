@@ -281,3 +281,16 @@ func TestFromRowsMatchesGradient(t *testing.T) {
 		}
 	}
 }
+
+// A gradient with a NaN leaves the genome as it was.
+func TestApplyIgnoresNaN(t *testing.T) {
+	g := model.Grown(1, 8, 100)
+	gr := Grad{W: make([]float64, len(g.BuildNetwork().Flat().From))}
+	gr.W[0] = math.NaN()
+	c := Apply(g, gr, 0.1, 0.1, 0.1)
+	for i := range c.Conns {
+		if c.Conns[i].Weight != g.Conns[i].Weight {
+			t.Fatal("a NaN gradient changed a weight")
+		}
+	}
+}

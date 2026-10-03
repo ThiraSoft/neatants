@@ -302,7 +302,11 @@ func learnStep(gs []*neat.Genome, gev *gpu.Evaluator, d *prep.Data, starts []int
 		}
 	}
 	t0 := time.Now()
+	bad := 0
 	for j, i := range fit {
+		if !grads[j].Finite() {
+			bad++
+		}
 		c := learn.Apply(gs[i], grads[j], *lrW, *lrEta, *lrTrait)
 		// A learned genome is a new one: no record to reuse, no lives to
 		// average its fitness with.
@@ -310,5 +314,8 @@ func learnStep(gs []*neat.Genome, gev *gpu.Evaluator, d *prep.Data, starts []int
 		gs[i] = c
 	}
 	learnTime += time.Since(t0)
+	if bad > 0 {
+		fmt.Fprintf(os.Stderr, "neattext: %d genomes with a non-finite gradient kept their weights\n", bad)
+	}
 	return bpb, over, learnTime
 }

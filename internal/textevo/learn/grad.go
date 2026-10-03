@@ -133,6 +133,11 @@ func gradient(g *neat.Genome, d *prep.Data, ids []int32, starts []int, length, w
 // evaluators cache records by genome pointer.
 func Apply(g *neat.Genome, gr Grad, lrW, lrEta, lrTrait float64) *neat.Genome {
 	c := g.Copy()
+	if !gr.Finite() {
+		// A NaN would go through the clamps below (max and min keep it)
+		// and poison the genome for good.
+		return c
+	}
 	f := g.BuildNetwork().Flat()
 	genes := g.EdgeGenes()
 	rw, re := rms(gr.W), rms(gr.Eta)
@@ -219,4 +224,19 @@ func FromRows(gs []*neat.Genome, fit []int, d *prep.Data, ids []int32, starts []
 	}
 	wg.Wait()
 	return grads
+}
+
+// Finite reports whether every value of the gradient is a number.
+func (gr Grad) Finite() bool {
+	for _, x := range gr.W {
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return false
+		}
+	}
+	for _, x := range gr.Eta {
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return false
+		}
+	}
+	return !math.IsNaN(gr.Trait) && !math.IsInf(gr.Trait, 0)
 }
