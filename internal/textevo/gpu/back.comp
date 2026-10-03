@@ -1,0 +1,277 @@
+#version 450
+// Backpropagation through time of one (genome, window) pair per workgroup,
+// the card's version of learn.Tape.Back (read it for the maths): the ticks go
+// in reverse, and in each of them the Oja rule, then the levels of the
+// network from the last to the first. The forward values of every tick come
+// from the tape netrun.comp wrote (built with -DTAPE).
+//
+// A level is done in three steps, as netrun.comp does it edge-parallel: a lane
+// takes a node and stores the gradient of each of its sums on its edges; a
+// lane takes an edge, adds the gradient of its weight to the sums of the
+// window and stores what it sends to its source; a lane takes a source and
+// adds what its edges sent. Several edges of a level may share a source, so
+// the record (see PackLearn) lists for each level the sources that need a
+// gradient, each with the edges that feed it in the order of the record: no
+// float atomics are needed and the result does not depend on the timing.
+//
+// The gradient of the weights of a pair goes to a slice of the grad buffer,
+// which reduce.comp sums over the windows of a genome.
+
+#ifndef LANES
+#define LANES 64u
+#endif
+layout(local_size_x = LANES) in;
+
+#extension GL_KHR_shader_subgroup_basic : require
+
+#ifdef SGBAR
+#define BAR() { subgroupMemoryBarrierShared(); subgroupBarrier(); }
+#else
+#define BAR() barrier()
+#endif
+
+layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
+layout(std430, binding = 1) readonly buffer Tape { float tape[]; };
+layout(std430, binding = 2) readonly buffer DO { float dO[]; };
+layout(std430, binding = 3) buffer Grad { float grad[]; };
+
+layout(push_constant) uniform Push {
+	uint pairs;
+	uint windows;
+	uint len;
+	uint warm;
+	uint dim;
+	uint goffOff;
+	uint listOff;
+	uint tapeOff;
+	uint total; // pairs of all classes: the table of learn.go holds a gradient base after the tape bases
+	float scale; // 2 / bytes: the output is o = 2v-1 and the loss is a bpb
+} pc;
+
+// The capacities of the shared arrays are specialization constants: back is
+// bound by how many workgroups are in flight, which the shared memory a
+// workgroup takes decides, so the pipeline is made for the largest genome of
+// the generation (see backSpec) instead of for the largest the kernel can run.
+layout(constant_id = 0) const uint MAX_VALUES = 1024u; // nodes and back copies
+layout(constant_id = 1) const uint MAX_MEMORY = 256u;
+layout(constant_id = 2) const uint MAX_PLASTIC = 256u;
+layout(constant_id = 3) const uint PROD_SIZE = 520u; // edges of a level, two for each plastic link of a piece
+
+// PIECE is how many plastic links one piece of the Oja step covers, so that
+// the two contributions of each fit in prod.
+#define PIECE 256u
+
+shared float dv[MAX_VALUES];   // gradient of the values of this tick, then of the copies of the previous one
+shared float dcar[MAX_MEMORY]; // gradient carried by the cells to the previous tick
+// The tape of the tick being run, [values and copies][sums][cells][plastic
+// weights] (see netrun.comp), is read where it is: shared memory holds as
+// little as possible, since what limits the kernel is how many workgroups are
+// in flight.
+uint tickBase, tickStride, tickT;
+#define TV(i) tape[tickBase + (i)]
+#define CPV(i) (tickT > 0u ? tape[tickBase - tickStride + cellOff + (i)] : 0.0)
+shared float gwq[MAX_PLASTIC]; // gradient of their weights
+shared float deta[MAX_PLASTIC];
+shared float prod[PROD_SIZE];
+
+// The derivative of the tanh of neatmath.glsl, zero where it saturates.
+// Its numerator, ((27+3x2)(27+9x2) - 18x2(27+x2)), is 9(9-x2)^2.
+float dtanh(float x) {
+	if (x > 3.0 || x < -3.0) return 0.0;
+	float x2 = x * x;
+	float a = 9.0 - x2, b = 3.0 + x2;
+	return a * a / (9.0 * b * b);
+}
+float tanh3(float x) {
+	if (x > 3.0) return 1.0;
+	if (x < -3.0) return -1.0;
+	float x2 = x * x;
+	return x * (27.0 + x2) / (27.0 + 9.0 * x2);
+}
+
+uint lane, n, pieceOff, groupOff, permOff, pwOff, sumOff, cellOff, gb;
+
+// gather adds, for each source of a piece, what its edges sent in prod.
+void gather(uint piece) {
+	uint gs = gw[pieceOff + 2u * piece], ge = gw[pieceOff + 2u * (piece + 1u)];
+	for (uint gi = gs + lane; gi < ge; gi += LANES) {
+		uint src = gw[groupOff + 2u * gi];
+		uint a = gw[groupOff + 2u * gi + 1u], e = gw[groupOff + 2u * gi + 3u];
+		float s = 0.0;
+		uint i = a;
+		for (; i + 4u <= e; i += 4u) {
+			uint p0 = gw[permOff + i], p1 = gw[permOff + i + 1u], p2 = gw[permOff + i + 2u], p3 = gw[permOff + i + 3u];
+			float x0 = prod[p0], x1 = prod[p1], x2 = prod[p2], x3 = prod[p3];
+			s = s + x0;
+			s = s + x1;
+			s = s + x2;
+			s = s + x3;
+		}
+		for (; i < e; i++) s = s + prod[gw[permOff + i]];
+		dv[src] += s;
+	}
+}
+
+// nodeStep gives the edges of a node the gradient of the sum of their slot.
+void nodeStep(uint ow, uvec4 of, uint o4, uint es) {
+	uint ni = ow & 0xFFFFu;
+	float dvn = dv[ni];
+	if ((ow & 0x80000000u) == 0u) {
+		float x = TV(sumOff + ni);
+		float ds = dvn * 1.225 * dtanh(2.45 * x);
+		for (uint k = of.x; k < of.y; k++) prod[k - es] = ds;
+	} else {
+		uint ci = (ow >> 16) & 0x7FFFu;
+		uint sb = sumOff + n + 3u * ci;
+		float sx = TV(sumOff + ni);
+		float si = TV(sb), sf = TV(sb + 1u), so = TV(sb + 2u);
+		float c = TV(cellOff + ci);
+		float cp = CPV(ci);
+		float ui = 0.5 * (si + 2.0), uf = 0.5 * (sf + 2.0), uo = 0.5 * (so + 2.0);
+		float ig = 0.5 + 0.5 * tanh3(ui), fg = 0.5 + 0.5 * tanh3(uf), og = 0.5 + 0.5 * tanh3(uo);
+		float tc = tanh3(c);
+		float dc = dcar[ci] + dvn * og * dtanh(c);
+		float tx = tanh3(sx);
+		float d0 = dc * ig * dtanh(sx);
+		float d1 = dc * tx * 0.25 * dtanh(ui);
+		float d2 = dc * cp * 0.25 * dtanh(uf);
+		float d3 = dvn * tc * 0.25 * dtanh(uo);
+		dcar[ci] = dc * fg;
+		for (uint k = of.x; k < of.y; k++) prod[k - es] = d0;
+		for (uint k = of.y; k < of.z; k++) prod[k - es] = d1;
+		for (uint k = of.z; k < of.w; k++) prod[k - es] = d2;
+		for (uint k = of.w; k < o4; k++) prod[k - es] = d3;
+	}
+}
+
+// edgeStep adds the gradient of the weight of edge k of the level starting at es
+// and stores what the edge sends to its source; sv is the value of its source.
+void edgeStep(uint k, uint es, uint w0, uint wb, float sv) {
+	uint pl = (w0 >> 16) & 0x7FFFu;
+	float ds = prod[k - es];
+	float w;
+	if (pl != 0u) {
+		gwq[pl - 1u] += ds * sv;
+		w = TV(pwOff + pl - 1u);
+	} else {
+		grad[gb + k] += ds * sv;
+		w = uintBitsToFloat(wb);
+	}
+	prod[k - es] = ds * w;
+}
+
+void main() {
+	if (gl_WorkGroupID.x >= pc.pairs) return;
+	uint p = gw[pc.listOff + gl_WorkGroupID.x];
+	lane = gl_LocalInvocationID.x;
+	uint g = p / pc.windows;
+	uint b = gw[pc.goffOff + g];
+	n = gw[b];
+	uint nOrder = gw[b + 1u], nLevels = gw[b + 2u], nPlastic = gw[b + 3u];
+	uint outStart = gw[b + 6u];
+	uint kindOff = b + 8u;
+	uint levelOff = kindOff + n;
+	uint orderOff = levelOff + 2u * (nLevels + 1u);
+	uint offOff = orderOff + nOrder;
+	uint nEdges = gw[offOff + 4u * nOrder];
+	uint edgeOff = offOff + 4u * nOrder + 1u;
+	uint plOff = edgeOff + 2u * nEdges;
+	uint extOff = plOff + 4u * nPlastic + 4u;
+	uint nMem = gw[extOff], nBack = gw[extOff + 1u], nPP = gw[extOff + 2u];
+	pieceOff = extOff + 4u;
+	uint nPieces = nLevels + nPP;
+	groupOff = pieceOff + 2u * (nPieces + 1u);
+	uint nGroups = gw[pieceOff + 2u * nPieces];
+	permOff = groupOff + 2u * (nGroups + 1u);
+	uint scored = pc.len - pc.warm;
+
+	uint tapeBase = gw[pc.tapeOff + p];
+	gb = gw[pc.tapeOff + pc.total + p];
+	sumOff = n + nBack;
+	cellOff = sumOff + n + 3u * nMem;
+	pwOff = cellOff + nMem;
+	uint stride = pwOff + nPlastic;
+
+	for (uint i = lane; i < n + nBack; i += LANES) dv[i] = 0.0;
+	for (uint i = lane; i < nMem; i += LANES) dcar[i] = 0.0;
+	for (uint q = lane; q < nPlastic; q += LANES) {
+		gwq[q] = 0.0;
+		deta[q] = 0.0;
+	}
+	for (uint i = lane; i < nEdges + nPlastic; i += LANES) grad[gb + i] = 0.0;
+	memoryBarrierBuffer();
+	BAR();
+
+	for (uint t = pc.len; t-- > 0u;) {
+		uint tb = tapeBase + t * stride;
+		tickBase = tb;
+		tickStride = stride;
+		tickT = t;
+		if (t >= pc.warm) {
+			uint r = (p * scored + (t - pc.warm)) * pc.dim;
+			for (uint j = lane; j < pc.dim; j += LANES) dv[outStart + j] += pc.scale * dO[r + j];
+		}
+		BAR();
+
+		// The learning rule of this tick, which ran after the node values.
+		for (uint pi = 0u; pi < nPP; pi++) {
+			uint q0 = pi * PIECE, q1 = min(q0 + PIECE, nPlastic);
+			for (uint q = q0 + lane; q < q1; q += LANES) {
+				uint at = plOff + 4u * q;
+				float pre = TV(gw[at + 1u]), post = TV(gw[at + 2u]);
+				float eta = uintBitsToFloat(gw[at + 3u]);
+				float w = TV(pwOff + q), gq = gwq[q];
+				precise float un = w + eta * post * (pre - post * w);
+				float c1 = 0.0, c2 = 0.0;
+				if (un < -8.0 || un > 8.0) {
+					gwq[q] = 0.0;
+				} else {
+					gwq[q] = gq * (1.0 - eta * post * post);
+					c1 = gq * eta * post;
+					c2 = gq * eta * (pre - 2.0 * post * w);
+					deta[q] += gq * post * (pre - post * w);
+				}
+				prod[2u * (q - q0)] = c1;
+				prod[2u * (q - q0) + 1u] = c2;
+			}
+			BAR();
+			gather(nLevels + pi);
+			BAR();
+		}
+
+		for (uint l = nLevels; l-- > 0u;) {
+			uint s = gw[levelOff + 2u * l], es = gw[levelOff + 2u * l + 1u];
+			uint e = gw[levelOff + 2u * l + 2u], ee = gw[levelOff + 2u * l + 3u];
+			// The gradient of each sum goes on the edges of its slot.
+			for (uint j = s + lane; j < e; j += LANES) {
+				uint ob = offOff + 4u * j;
+				nodeStep(gw[orderOff + j], uvec4(gw[ob], gw[ob + 1u], gw[ob + 2u], gw[ob + 3u]), gw[ob + 4u], es);
+			}
+			BAR();
+			// The gradient of each weight, and what the edge sends to its source.
+			for (uint k = es + lane; k < ee; k += LANES) {
+				uint w0 = gw[edgeOff + 2u * k];
+				edgeStep(k, es, w0, gw[edgeOff + 2u * k + 1u], TV(w0 & 0xFFFFu));
+			}
+			BAR();
+			gather(l);
+			BAR();
+		}
+
+		// What this tick sent to the previous one is what it receives.
+		for (uint x = lane; x < n; x += LANES) {
+			uint bc = gw[kindOff + x] >> 8;
+			dv[x] = bc != 0u ? dv[n + bc - 1u] : 0.0;
+		}
+		BAR();
+		for (uint i = lane; i < nBack; i += LANES) dv[n + i] = 0.0;
+		BAR();
+	}
+
+	// What is carried to tick 0 is the gradient of the starting weight of a
+	// plastic link.
+	for (uint q = lane; q < nPlastic; q += LANES) {
+		grad[gb + gw[plOff + 4u * q]] = gwq[q];
+		grad[gb + nEdges + q] = deta[q];
+	}
+}

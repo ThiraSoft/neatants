@@ -121,7 +121,11 @@ const (
 // CPU does. A level with more than LevelEdges edges is split in several,
 // which is still a valid order since nodes of one level never read each
 // other.
-func Pack(dst []uint32, f *neat.Flat) []uint32 {
+func Pack(dst []uint32, f *neat.Flat) []uint32 { return pack(dst, f, nil) }
+
+// pack is Pack; with moved of len(f.From) it also tells where each edge of f
+// landed in the record's order (-1 for an edge no node reads).
+func pack(dst []uint32, f *neat.Flat, moved []int32) []uint32 {
 	n := f.Nodes()
 	back, _ := backCopies(f)
 	nOrder := len(f.Order)
@@ -162,7 +166,9 @@ func Pack(dst []uint32, f *neat.Flat) []uint32 {
 		w[kindOff+j] = uint32(k) | back[j]<<8
 	}
 	// moved[k] is where edge k of f lands.
-	moved := make([]int32, len(f.From))
+	if moved == nil {
+		moved = make([]int32, len(f.From))
+	}
 	for i := range moved {
 		moved[i] = -1
 	}

@@ -22,6 +22,8 @@ type genLayout struct {
 	// pairs[0] of the small variant, then the pairs[1] of the big one.
 	listOff int
 	pairs   [2]int
+	// tapeOff is where the table of learn.go starts, after the records.
+	tapeOff int
 }
 
 // layoutSize is the number of words of the upload for these records.
@@ -103,6 +105,8 @@ func buildGen(flats []*neat.Flat, scales []float32, starts []int) genLayout {
 // netPush is the push constant block of netrun.comp.
 type netPush struct {
 	Pairs, Windows, Len, Warm, Dim, StartsOff, GoffOff, ListOff, Outs uint32
+	// TapeOff is read by the tape variants only (see learn.go).
+	TapeOff uint32
 }
 
 // newNetPipes builds the small and the big variant of netrun.
@@ -132,7 +136,7 @@ func recordNet(r *vk.Recorder, sets [2]*vk.Set, gen genLayout, windows, length, 
 			continue
 		}
 		push := netPush{uint32(n), uint32(windows), uint32(length), uint32(warm), uint32(dim),
-			uint32(gen.startsOff), uint32(gen.goffOff), uint32(off), uint32(outs)}
+			uint32(gen.startsOff), uint32(gen.goffOff), uint32(off), uint32(outs), uint32(gen.tapeOff)}
 		r.Dispatch(sets[c], uint32(n), unsafe.Pointer(&push))
 		off += n
 	}

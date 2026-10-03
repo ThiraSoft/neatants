@@ -57,8 +57,12 @@ type Evaluator struct {
 	skipNet, skipXent bool
 	// skipCopy leaves the readback of the gradient out of EvaluateGrad.
 	skipCopy bool
-	// grad is the state of EvaluateGrad, built on first use.
+	// grad is the state of EvaluateGrad, built on first use, and lrn the one
+	// EvaluateLearn adds.
 	grad gradState
+	lrn  learnState
+	// skipBack leaves the backward kernels out of EvaluateLearn. Tests only.
+	skipBack bool
 	// coop says that xent runs on the matrix cores.
 	coop bool
 
@@ -176,6 +180,7 @@ func packHalves(x []float32) []uint32 {
 func (e *Evaluator) Close() {
 	e.dropSets()
 	e.grad.close()
+	e.lrn.close()
 	for _, p := range []*vk.Pipeline{e.netPipe[0], e.netPipe[1], e.xentPipe, e.treePipe} {
 		if p != nil {
 			p.Close()
@@ -193,6 +198,7 @@ func (e *Evaluator) Close() {
 
 func (e *Evaluator) dropSets() {
 	e.grad.dropSets()
+	e.lrn.dropSets()
 	for i := range e.netSet {
 		for c := range e.netSet[i] {
 			if e.netSet[i][c] != nil {
@@ -290,6 +296,7 @@ func (e *Evaluator) Validate(g *neat.Genome) (float64, error) {
 func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []int, length, warm int, grad *gradOut) ([]float64, int, error) {
 	d := e.data
 	start := time.Now()
+	denom := float64(model.WindowBytes(d, ids, starts, length, warm))
 	// The kernel finds the banks of a network from its inputs, so a genome
 	// of another shape would read past the embedding row: it is a
 	// programming error, caught here rather than in the packing goroutines.
@@ -302,7 +309,7 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 			return nil, 0, fmt.Errorf("gpu: a genome with %d predictions, the evaluator scores %d", p, outs)
 		}
 	}
-	slots := e.pack(gs, kind == 0)
+	slots := e.pack(gs, kind == 0, grad != nil && grad.learn)
 	bpb := make([]float64, len(gs))
 	var recs [][]uint32
 	var class []int8
@@ -348,7 +355,16 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		return nil, 0, fmt.Errorf("gpu: %d rows to score, over what one dispatch of xent_grad covers (%d): lower -pop, -windows or -len",
 			rows, xentGradRows*maxGroups)
 	}
-	genBytes := 4 * layoutSize(recs, len(starts))
+	var plan learnPlan
+	var spec [4]uint32
+	if grad != nil && grad.learn {
+		spec = backSpec(recs)
+		var err error
+		if plan, err = planLearn(recs, len(starts), length); err != nil {
+			return nil, 0, err
+		}
+	}
+	genBytes := 4 * (layoutSize(recs, len(starts)) + plan.words)
 	if (rows+treeRows-1)/treeRows > maxGroups {
 		return nil, 0, fmt.Errorf("gpu: %d rows to score, over what one dispatch of tree covers (%d): lower -pop, -windows or -len",
 			rows, treeRows*maxGroups)
@@ -357,13 +373,22 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		return nil, 0, err
 	}
 	if grad != nil {
-		if err := e.gradReady(kind, rows); err != nil {
+		if err := e.gradReady(kind, rows, !grad.learn); err != nil {
+			return nil, 0, err
+		}
+	}
+	if grad != nil && grad.learn {
+		if err := e.learnReady(kind, plan, spec); err != nil {
 			return nil, 0, err
 		}
 	}
 	// The records go straight into the staging buffer.
 	up := unsafe.Slice((*uint32)(unsafe.Pointer(&e.up.Bytes()[0])), genBytes/4)
 	gen := layoutInto(up, recs, class, scales, starts)
+	if grad != nil && grad.learn {
+		gen.tapeOff = len(gen.words)
+		plan.fill(up[gen.tapeOff : gen.tapeOff+plan.words])
+	}
 	e.Timing.Pack = time.Since(start)
 	start = time.Now()
 	xp := xentPush{uint32(rows), uint32(d.Vocab()), uint32(d.Dim), uint32(scored), uint32(len(starts)), uint32(warm),
@@ -372,7 +397,11 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		r.Copy(e.gen, 0, e.up, genBytes)
 		r.TransferBarrier()
 		if !e.skipNet {
-			recordNet(r, e.netSet[kind], gen, len(starts), length, warm, d.Dim, outs)
+			sets := e.netSet[kind]
+			if grad != nil && grad.learn {
+				sets = e.lrn.netSet[kind]
+			}
+			recordNet(r, sets, gen, len(starts), length, warm, d.Dim, outs)
 			r.Barrier()
 		}
 		if !e.skipXent && e.tree != nil {
@@ -380,7 +409,10 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 				uint32(gen.startsOff), uint32(gen.scaleOff)}
 			r.Dispatch(e.treeSet[kind], uint32((rows+treeRows-1)/treeRows), unsafe.Pointer(&tp))
 		} else if grad != nil {
-			e.recordGrad(r, kind, rows, unsafe.Pointer(&xp))
+			e.recordGrad(r, kind, rows, unsafe.Pointer(&xp), !grad.learn)
+			if grad.learn {
+				e.recordBack(r, gen, plan, spec, len(starts), length, warm, float32(2/denom))
+			}
 		} else if !e.skipXent {
 			groups := uint32((rows + e.xentRows - 1) / e.xentRows)
 			if e.coop {
@@ -398,7 +430,6 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 	start = time.Now()
 	bits := unsafe.Slice((*float32)(unsafe.Pointer(&e.bits.Bytes()[0])), rows)
 	per := len(starts) * scored
-	denom := float64(model.WindowBytes(d, ids, starts, length, warm))
 	for j, i := range fitIdx {
 		sum := 0.0
 		for _, b := range bits[j*per : (j+1)*per] {
@@ -412,10 +443,16 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		bpb[i] = sum / denom
 	}
 	if grad != nil && !e.skipCopy {
-		grad.dO = make([]float32, rows*d.Dim)
-		copy(grad.dO, unsafe.Slice((*float32)(unsafe.Pointer(&e.grad.dOrd.Bytes()[0])), rows*d.Dim))
+		if !grad.learn {
+			grad.dO = make([]float32, rows*d.Dim)
+			copy(grad.dO, unsafe.Slice((*float32)(unsafe.Pointer(&e.grad.dOrd.Bytes()[0])), rows*d.Dim))
+		}
 		grad.dS = make([]float32, rows)
 		copy(grad.dS, unsafe.Slice((*float32)(unsafe.Pointer(&e.grad.dSrd.Bytes()[0])), rows))
+		if grad.learn {
+			grad.grads = e.readLearn(gs, fitIdx, slots, plan, grad.dS, per, denom)
+			grad.dS = nil
+		}
 	}
 	e.Timing.Sum = time.Since(start)
 	return bpb, over, nil
@@ -430,6 +467,10 @@ type packed struct {
 	fits  bool
 	class int8
 	g     *neat.Genome
+	// ext says that rec ends with the learning part (see PackLearn), and
+	// moved then tells where each edge of the genome's Flat landed in rec.
+	ext   bool
+	moved []int32
 }
 
 // same reports whether g has exactly the genes p was built from. Origin only
@@ -446,7 +487,7 @@ func (p *packed) same(g *neat.Genome) bool {
 // Origin and checked gene by gene) reuses that genome's record; the slots alternate between two sets so that the records
 // a copy reads are never the ones being rewritten, and their buffers are
 // reused from one generation to the next instead of being allocated again.
-func (e *Evaluator) pack(gs []*neat.Genome, cache bool) []packed {
+func (e *Evaluator) pack(gs []*neat.Genome, cache, ext bool) []packed {
 	var slots []packed
 	var prev map[int]*packed
 	if cache {
@@ -463,16 +504,25 @@ func (e *Evaluator) pack(gs []*neat.Genome, cache bool) []packed {
 		if cache {
 			s.g = g
 		}
-		if p := prev[g.Origin]; g.Origin > 0 && p != nil && p.same(g) {
+		s.ext = ext
+		if p := prev[g.Origin]; g.Origin > 0 && p != nil && p.ext == ext && p.same(g) {
 			s.fits, s.class, s.rec = p.fits, p.class, append(s.rec[:0], p.rec...)
+			s.moved = append(s.moved[:0], p.moved...)
 			return
 		}
 		f := g.BuildNetwork().Flat()
 		s.class = int8(netClass(f))
-		if s.fits = s.class >= 0; s.fits {
-			s.rec = Pack(s.rec[:0], f)
-		} else {
+		switch s.fits = s.class >= 0; {
+		case !s.fits:
 			s.rec = s.rec[:0]
+		case ext:
+			if cap(s.moved) < len(f.From) {
+				s.moved = make([]int32, len(f.From))
+			}
+			s.moved = s.moved[:len(f.From)]
+			s.rec = PackLearn(s.rec[:0], f, s.moved)
+		default:
+			s.rec = Pack(s.rec[:0], f)
 		}
 	})
 	if cache {

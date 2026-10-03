@@ -36,6 +36,10 @@ layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
 layout(std430, binding = 1) readonly buffer Tokens { uint tokens[]; };
 layout(std430, binding = 2) readonly buffer Emb { float emb[]; };
 layout(std430, binding = 3) writeonly buffer Rows { uint rows[]; }; // two halves per word
+#ifdef TAPE
+// The tape of learn.go: what the backward pass reads, see back.comp.
+layout(std430, binding = 4) writeonly buffer Tape { float tape[]; };
+#endif
 
 layout(push_constant) uniform Push {
 	uint pairs;
@@ -47,6 +51,9 @@ layout(push_constant) uniform Push {
 	uint goffOff;
 	uint listOff;
 	uint outs; // prediction outputs: dim, or the depth of the tree scoring
+#ifdef TAPE
+	uint tapeOff; // the tape bases of the pairs, see learn.go
+#endif
 } pc;
 
 #define MAX_BANKS 4u
@@ -106,16 +113,29 @@ void edge(uint k, uint fw, uint wb) {
 	prod[k] = x;
 }
 
+#ifdef TAPE
+// Where the sums of the tick being run go, and the node count.
+uint gSum, gN;
+#endif
+
 // node computes one node from the products of its level, its offsets
 // counted from the first edge of the level.
 void node(uint ow, uvec4 of, uint o4) {
 	uint ni = ow & 0xFFFFu;
 	float s0 = sumProd(of.x, of.y);
+#ifdef TAPE
+	tape[gSum + ni] = s0;
+#endif
 	if ((ow & 0x80000000u) == 0u) {
 		v[ni] = sig(s0);
 	} else {
 		float s1 = sumProd(of.y, of.z), s2 = sumProd(of.z, of.w), s3 = sumProd(of.w, o4);
 		uint ci = (ow >> 16) & 0x7FFFu;
+#ifdef TAPE
+		tape[gSum + gN + 3u * ci] = s1;
+		tape[gSum + gN + 3u * ci + 1u] = s2;
+		tape[gSum + gN + 3u * ci + 2u] = s3;
+#endif
 		precise float ig = sig01(s1 + 2.0);
 		precise float fg = sig01(s2 + 2.0);
 		precise float og = sig01(s3 + 2.0);
@@ -151,6 +171,16 @@ void main() {
 	// The state banks are inputs after the embedding (see model.Shape), so
 	// the record says how many a network has.
 	uint banks = (inEnd - inStart) / pc.dim - 1u;
+#ifdef TAPE
+	// The record's learning part says how many cells and back copies it has;
+	// a tick of the tape is [values and copies][sums][cells][plastic weights].
+	uint extOff = plOff + 4u * nPlastic + 4u;
+	uint nMem = gw[extOff], nBack = gw[extOff + 1u];
+	uint tapeBase = gw[pc.tapeOff + p];
+	uint sumOff = n + nBack, cellOff = sumOff + n + 3u * nMem, pwOff = cellOff + nMem;
+	uint stride = pwOff + nPlastic;
+	gN = n;
+#endif
 
 	for (uint i = lane; i < n; i += LANES) v[i] = 0.0;
 	for (uint i = lane; i < MAX_MEMORY; i += LANES) cell[i] = 0.0;
@@ -158,6 +188,10 @@ void main() {
 	BAR();
 
 	for (uint t = 0u; t < pc.len; t++) {
+#ifdef TAPE
+		uint tb = tapeBase + t * stride;
+		gSum = tb + sumOff;
+#endif
 		uint row = tokens[start + t] * pc.dim;
 		// The write rate of each bank, from the gate the network wrote at the
 		// tick before; nothing has written a gate before the first tick, which
@@ -195,6 +229,9 @@ void main() {
 			if (back != 0u) v[n + back - 1u] = y;
 		}
 		BAR();
+#ifdef TAPE
+		for (uint q = lane; q < nPlastic; q += LANES) tape[tb + pwOff + q] = pw[q];
+#endif
 
 		// The loads of a level do not depend on any product, so those of the
 		// first edge and the first node of each lane are asked for one level
@@ -232,6 +269,10 @@ void main() {
 			cur = nxt;
 		}
 
+#ifdef TAPE
+		for (uint x = lane; x < n + nBack; x += LANES) tape[tb + x] = v[x];
+		for (uint c = lane; c < nMem; c += LANES) tape[tb + cellOff + c] = cell[c];
+#endif
 		if (t >= pc.warm) {
 			uint r = (p * scored + (t - pc.warm)) * ho;
 			for (uint j = lane; j < ho; j += LANES) {

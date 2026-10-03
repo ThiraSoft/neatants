@@ -1,0 +1,28 @@
+#version 450
+// Sums the gradients of the windows of each genome (see back.comp), in the
+// order of the windows: one workgroup a genome. The table of learn.go gives
+// the slice of each pair, and where the result of each genome goes.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
+layout(std430, binding = 1) readonly buffer Grad { float grad[]; };
+layout(std430, binding = 2) writeonly buffer Out { float outg[]; };
+
+layout(push_constant) uniform Push {
+	uint genomes;
+	uint windows;
+	uint tapeOff;
+	uint total; // pairs
+} pc;
+
+void main() {
+	uint g = gl_WorkGroupID.x;
+	if (g >= pc.genomes) return;
+	uint ob = gw[pc.tapeOff + 2u * pc.total + g];
+	uint count = gw[pc.tapeOff + 2u * pc.total + pc.genomes + g];
+	for (uint i = gl_LocalInvocationID.x; i < count; i += 128u) {
+		float s = 0.0;
+		for (uint w = 0u; w < pc.windows; w++) s += grad[gw[pc.tapeOff + pc.total + g * pc.windows + w] + i];
+		outg[ob + i] = s;
+	}
+}

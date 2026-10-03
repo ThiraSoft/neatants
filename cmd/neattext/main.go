@@ -52,7 +52,7 @@ var (
 	input     = flag.String("input", "emb", "-score tree only: what a network reads of a token, emb (its embedding), code (its path in the tree) or both")
 	banks     = flag.Int("state", 0, "state banks every network reads, 0 to 4: running averages of the embeddings at four time scales, written through gates")
 	learnOn   = flag.Bool("learn", false, "Lamarckian learning: every genome takes a step of backpropagation through time on its windows each generation, and its children inherit the learned weights")
-	lrW       = flag.Float64("lr", 0.02, "-learn: step of the link weights (normalized gradient descent)")
+	lrW       = flag.Float64("lr", 0.05, "-learn: step of the link weights (normalized gradient descent)")
 	lrEta     = flag.Float64("lr-eta", 0.002, "-learn: step of the plasticity rates")
 	lrTrait   = flag.Float64("lr-trait", 0.01, "-learn: step of the logit scale trait")
 	cpu       = flag.Bool("cpu", false, "evaluate on the CPU reference instead of the GPU")

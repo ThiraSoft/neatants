@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"github.com/ThiraSoft/golem/vk"
+	"github.com/ThiraSoft/neatants/internal/textevo/learn"
 	"github.com/ThiraSoft/neatants/neat"
 )
 
@@ -87,7 +88,7 @@ func (g *gradState) close() {
 
 // gradReady builds the pipeline, makes the buffers hold rows rows of dim floats
 // and binds the sets of kind, after e.grow made the shared buffers.
-func (e *Evaluator) gradReady(kind, rows int) error {
+func (e *Evaluator) gradReady(kind, rows int, readDO bool) error {
 	g := &e.grad
 	if g.pipe == nil {
 		coopDim := 0
@@ -103,6 +104,7 @@ func (e *Evaluator) gradReady(kind, rows int) error {
 	dim := e.data.Dim
 	if need := rows * dim * 4; need > g.capDO {
 		g.dropSets()
+		e.lrn.dropSets()
 		for _, b := range []**vk.Buffer{&g.dO, &g.dOrd} {
 			if *b != nil {
 				(*b).Close()
@@ -115,10 +117,14 @@ func (e *Evaluator) gradReady(kind, rows int) error {
 		if g.dO, err = e.d.Local(n, vk.UsageStorage|vk.UsageTransferSrc); err != nil {
 			return err
 		}
-		if g.dOrd, err = e.d.Readback(n, vk.UsageTransferDst); err != nil {
+		g.capDO = n
+	}
+	// The learning kernel reads dO on the card: only EvaluateGrad copies it.
+	if g.dOrd == nil && readDO {
+		var err error
+		if g.dOrd, err = e.d.Readback(g.capDO, vk.UsageTransferDst); err != nil {
 			return err
 		}
-		g.capDO = n
 	}
 	if need := rows * 4; need > g.capDS {
 		g.dropSets()
@@ -151,6 +157,10 @@ func (e *Evaluator) gradReady(kind, rows int) error {
 type gradOut struct {
 	fit    []int
 	dO, dS []float32
+	// learn asks for the gradients of the weights as well (EvaluateLearn),
+	// which come back in grads and leave no dO.
+	learn bool
+	grads []learn.Grad
 }
 
 // EvaluateGrad is Evaluate plus the gradient of the bits of every scored row
@@ -188,7 +198,7 @@ func (e *Evaluator) EvaluateGrad(gs []*neat.Genome, starts []int, length, warm i
 
 // recordGrad dispatches the fused kernel and copies its results to the
 // readback buffers.
-func (e *Evaluator) recordGrad(r *vk.Recorder, kind, rows int, push unsafe.Pointer) {
+func (e *Evaluator) recordGrad(r *vk.Recorder, kind, rows int, push unsafe.Pointer, copyDO bool) {
 	if !e.skipXent {
 		if e.coop {
 			r.DispatchWide(e.grad.set[kind], 1, uint32((rows+xentGradCoopRows-1)/xentGradCoopRows), push)
@@ -198,7 +208,9 @@ func (e *Evaluator) recordGrad(r *vk.Recorder, kind, rows int, push unsafe.Point
 		r.Barrier()
 	}
 	if !e.skipCopy {
-		r.Copy(e.grad.dOrd, 0, e.grad.dO, rows*e.data.Dim*4)
+		if copyDO {
+			r.Copy(e.grad.dOrd, 0, e.grad.dO, rows*e.data.Dim*4)
+		}
 		r.Copy(e.grad.dSrd, 0, e.grad.dS, rows*4)
 	}
 }

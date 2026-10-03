@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -267,23 +268,30 @@ func save(dir string, c champion) error {
 // learnStep scores every genome on the windows at starts, then replaces each
 // with a copy that took one step of gradient descent on the same windows
 // (Lamarckian learning: the children inherit the learned weights). The bpb
-// returned are those before the step, so the fitness never saw the windows
-// it is judged on. On the card the softmax and its gradient run there and
-// only the backward pass through the networks runs here; with -cpu all of it
-// runs on the CPU. learnTime is the part spent in the backward pass.
+// returned are those before the step. On the card the whole backward pass
+// runs there, or only the softmax when the tape would not fit; with -cpu all
+// of it runs on the CPU. learnTime is the part of the backward pass spent on
+// the CPU, and the update of the genomes.
 func learnStep(gs []*neat.Genome, gev *gpu.Evaluator, d *prep.Data, starts []int) (bpb []float64, over int, learnTime time.Duration) {
 	var fit []int
 	var grads []learn.Grad
 	if gev != nil {
-		var dO, dS []float32
 		var err error
-		bpb, over, fit, dO, dS, err = gev.EvaluateGrad(gs, starts, *length, *warm)
-		if err != nil {
+		bpb, over, fit, grads, err = gev.EvaluateLearn(gs, starts, *length, *warm)
+		if errors.Is(err, gpu.ErrTape) {
+			// The tape of this generation does not fit on the card: the
+			// backward pass runs on the CPU from the row gradients.
+			var dO, dS []float32
+			bpb, over, fit, dO, dS, err = gev.EvaluateGrad(gs, starts, *length, *warm)
+			if err != nil {
+				fail(1, "%v", err)
+			}
+			t0 := time.Now()
+			grads = learn.FromRows(gs, fit, d, d.Train, starts, *length, *warm, dO, dS)
+			learnTime = time.Since(t0)
+		} else if err != nil {
 			fail(1, "%v", err)
 		}
-		t0 := time.Now()
-		grads = learn.FromRows(gs, fit, d, d.Train, starts, *length, *warm, dO, dS)
-		learnTime = time.Since(t0)
 	} else {
 		t0 := time.Now()
 		bpb, grads = learn.Gradient(gs, d, d.Train, starts, *length, *warm)

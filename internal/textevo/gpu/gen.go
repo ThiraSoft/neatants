@@ -11,3 +11,7 @@ package gpu
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DDIM=32 xent_grad_coop.comp -o xent_grad_coop32.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DDIM=64 xent_grad_coop.comp -o xent_grad_coop64.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DDIM=128 xent_grad_coop.comp -o xent_grad_coop128.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -I../../gpubrain -DTAPE -DMAX_VALUES=1024u -DMAX_MEMORY=256u -DMAX_PLASTIC=256u -DLEVEL_EDGES=520u -DLANES=64u netrun.comp -o netrun_tape.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -I../../gpubrain -DTAPE -DMAX_VALUES=2048u -DMAX_MEMORY=1024u -DMAX_PLASTIC=1024u -DLEVEL_EDGES=520u -DLANES=64u netrun.comp -o netrun_tape_big.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -I../../gpubrain -DLANES=64u back.comp -o back.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute reduce.comp -o reduce.spv
