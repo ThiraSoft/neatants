@@ -156,7 +156,7 @@ func runEvolve() {
 	w.Write(header)
 	fmt.Println(strings.Join(header, ","))
 
-	fmt.Printf("data %s, dim %d, links %d, wmut %g, state %d, pop %d, score %s\n", *dataPath, d.Dim, *links, *wmut, *banks, *pop, *score)
+	fmt.Printf("data %s, dim %d, links %d, wmut %g, state %d, pop %d, score %s, learn %v, widen %g\n", *dataPath, d.Dim, *links, *wmut, *banks, *pop, *score, *learnOn, *widen)
 	if tr != nil {
 		fmt.Printf("tree of depth %d over %d tokens, input %s (%d values a token)\n", tr.Depth, d.Vocab(), *input, rows.Dim)
 	}
@@ -171,6 +171,7 @@ func runEvolve() {
 	neat.HebbRate = *hebb
 	neat.MinimalLinks = *links
 	neat.WeightsPerMutation = *wmut
+	neat.WidenRate, neat.WidenNodes, neat.WidenIn, neat.WidenOut = *widen, *widenN, *widenIn, *widenOut
 	cfg := evo.DefaultConfig()
 	cfg.Pop = *pop
 	// -links counts the bank inputs like the embedding ones: a fresh output

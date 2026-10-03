@@ -108,3 +108,35 @@ func TestEdgeGenes(t *testing.T) {
 		}
 	}
 }
+
+// A widening adds the block and changes nothing the network computes: the
+// new neurons are read with weight zero.
+func TestWidenKeepsTheFunction(t *testing.T) {
+	for seed := range int64(10) {
+		rand.Seed(seed)
+		g := NewGenome(1, 12, 5)
+		for range 150 {
+			g.Mutate()
+		}
+		g.AddMemory()
+		w := g.Copy()
+		w.Widen()
+		if len(w.Nodes) != len(g.Nodes)+WidenNodes {
+			t.Fatalf("seed %d: %d nodes, want %d", seed, len(w.Nodes), len(g.Nodes)+WidenNodes)
+		}
+		fa, fb := g.BuildNetwork().Flat(), w.BuildNetwork().Flat()
+		sa, sb := fa.NewState(), fb.NewState()
+		in := make([]float32, 12)
+		for tick := range 30 {
+			for i := range in {
+				in[i] = float32(rand.NormFloat64())
+			}
+			a, b := fa.Activate(sa, in), fb.Activate(sb, in)
+			for i := range a {
+				if a[i] != b[i] {
+					t.Fatalf("seed %d tick %d: output %d is %g, was %g", seed, tick, i, b[i], a[i])
+				}
+			}
+		}
+	}
+}

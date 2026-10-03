@@ -31,6 +31,7 @@ func init() {
 const (
 	nodeSplit  = iota // hidden node splitting a connection
 	nodeMemory        // memory cell fed by one node, read by another
+	nodeWiden         // hidden node of a block added by a widening
 )
 
 // globalNodeID returns the ID registered for this structural mutation, or a
@@ -343,6 +344,9 @@ func (g *Genome) Mutate() {
 	if rand.Float64() < RemoveNodeRate {
 		g.removeNodeMutation()
 	}
+	if rand.Float64() < WidenRate {
+		g.widenMutation()
+	}
 	g.prune()
 }
 
@@ -422,6 +426,67 @@ func (g *Genome) removeNodeMutation() {
 					Innovation: getGateInnovation(a.In, b.Out, b.Gate), Gate: b.Gate,
 				})
 			}
+		}
+	}
+}
+
+// Widening, per Mutate: a block of WidenNodes hidden neurons, each reading
+// WidenIn random inputs and read by WidenOut random neurons. Single-node
+// mutations grow networks deep and thin, one input and one output a neuron;
+// a learner that tunes many weights at once (textevo -learn) needs width. Off
+// unless WidenRate is set.
+var (
+	WidenRate  = 0.0
+	WidenNodes = 8
+	WidenIn    = 16
+	WidenOut   = 8
+)
+
+// Widen adds a block of hidden neurons as the widening mutation does.
+func (g *Genome) Widen() {
+	g.sorted = nil
+	g.widenMutation()
+}
+
+// widenMutation adds the block with its outgoing weights at zero, so that the
+// network computes exactly what it did (Net2Net): only a learner, or later
+// mutations, make the new neurons matter. The incoming weights are drawn with
+// a spread of 1/sqrt(WidenIn) so the new sums start in the useful range.
+func (g *Genome) widenMutation() {
+	var srcs, dsts []int
+	// The block reads only inputs and the bias, which depend on nothing: a
+	// source computed by the network could change the order in which
+	// BuildNetwork breaks cycles, and with it which links read the previous
+	// tick, so the network would no longer compute the same thing.
+	for _, n := range g.Nodes {
+		if n.Type == Sensor || n.Type == Bias {
+			srcs = append(srcs, n.ID)
+		}
+		if n.Type == Output || n.Type == Hidden || n.Type == Memory {
+			dsts = append(dsts, n.ID)
+		}
+	}
+	if len(srcs) == 0 || len(dsts) == 0 || WidenNodes < 1 {
+		return
+	}
+	pick := func(from []int, k int) []int {
+		k = min(k, len(from))
+		out := make([]int, 0, k)
+		for _, i := range rand.Perm(len(from))[:k] {
+			out = append(out, from[i])
+		}
+		return out
+	}
+	in, out := pick(srcs, WidenIn), pick(dsts, WidenOut)
+	spread := 1 / math.Sqrt(float64(len(in)))
+	for j := range WidenNodes {
+		nid := g.globalNodeID([3]int{nodeWiden, out[0], j})
+		g.Nodes = append(g.Nodes, NodeGene{nid, Hidden})
+		for _, a := range in {
+			g.Conns = append(g.Conns, ConnGene{In: a, Out: nid, Weight: rand.NormFloat64() * spread, Enabled: true, Innovation: getInnovation(a, nid)})
+		}
+		for _, b := range out {
+			g.Conns = append(g.Conns, ConnGene{In: nid, Out: b, Weight: 0, Enabled: true, Innovation: getInnovation(nid, b)})
 		}
 	}
 }
