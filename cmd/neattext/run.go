@@ -29,17 +29,28 @@ type evaluator interface {
 	Validate(g *neat.Genome) (float64, error)
 }
 
-// cpuEval is the reference evaluation behind the evaluator interface. It has
-// no size limit, so nothing is ever oversized.
-type cpuEval struct{ d *prep.Data }
+// cpuEval is the reference evaluation behind the evaluator interface, with
+// the tree scoring when t is set. It has no size limit, so nothing is ever
+// oversized.
+type cpuEval struct {
+	d *prep.Data
+	t *model.Tree
+}
 
 func (c cpuEval) Evaluate(gs []*neat.Genome, starts []int, length, warm int) ([]float64, int, error) {
-	return ref.Evaluate(gs, c.d, c.d.Train, starts, length, warm), 0, nil
+	return c.eval(gs, c.d.Train, starts, length, warm), 0, nil
 }
 
 func (c cpuEval) Validate(g *neat.Genome) (float64, error) {
 	ids := c.d.Val
-	return ref.Evaluate([]*neat.Genome{g}, c.d, ids, model.ValStarts(len(ids)), model.ValLen, model.Warm)[0], nil
+	return c.eval([]*neat.Genome{g}, ids, model.ValStarts(len(ids)), model.ValLen, model.Warm)[0], nil
+}
+
+func (c cpuEval) eval(gs []*neat.Genome, ids []int32, starts []int, length, warm int) []float64 {
+	if c.t != nil {
+		return ref.EvaluateTree(gs, c.d, c.t, ids, starts, length, warm)
+	}
+	return ref.Evaluate(gs, c.d, ids, starts, length, warm)
 }
 
 var header = []string{"gen", "best_bpb", "mean_bpb", "species", "nodes", "edges", "memory", "plastic", "oversized", "eval_ms", "total_ms", "val_bpb"}
@@ -66,6 +77,15 @@ func runEvolve() {
 	if *banks < 0 || *banks > model.MaxBanks {
 		fail(2, "-state must be between 0 and %d", model.MaxBanks)
 	}
+	if *score != "softmax" && *score != "tree" {
+		fail(2, "-score must be softmax or tree")
+	}
+	if *input != model.InputEmb && *input != model.InputCode && *input != model.InputBoth {
+		fail(2, "-input must be emb, code or both")
+	}
+	if *input != model.InputEmb && *score != "tree" {
+		fail(2, "-input %s needs -score tree", *input)
+	}
 	// The dimension is the prepared file's: -dim only tells -prep what to
 	// write, so a run never has to repeat it.
 	d := load()
@@ -73,14 +93,40 @@ func runEvolve() {
 		fail(2, "-len %d leaves no room in %d train tokens", *length, len(d.Train))
 	}
 
-	var ev evaluator = cpuEval{d}
+	// rows is what the networks read of a token, d itself unless -input
+	// says otherwise; the corpus and the scoring are d's.
+	rows := d
+	var tr *model.Tree
+	saved, savedIn := "", ""
+	if *score == "tree" {
+		tr = model.BuildTree(d)
+		rows = model.InputData(d, tr, *input)
+		if tr.Depth > rows.Dim {
+			fail(2, "a tree of depth %d needs an embedding at least as wide, -input code reads one", tr.Depth)
+		}
+		saved = "tree"
+		if *input != model.InputEmb {
+			savedIn = *input
+		}
+	}
+	shape := model.Shape{Dim: rows.Dim, Banks: *banks}
+	if tr != nil && tr.Depth != rows.Dim {
+		shape.Code = tr.Depth
+	}
+
+	var ev evaluator = cpuEval{rows, tr}
 	if !*cpu {
 		dev, err := vk.Open()
 		if err != nil {
 			fail(1, "no Vulkan device (%v), try -cpu", err)
 		}
 		defer dev.Close()
-		ge, err := gpu.New(dev, d)
+		var ge *gpu.Evaluator
+		if tr != nil {
+			ge, err = gpu.NewTree(dev, rows, tr)
+		} else {
+			ge, err = gpu.New(dev, d)
+		}
 		if err != nil {
 			fail(1, "%v", err)
 		}
@@ -104,7 +150,10 @@ func runEvolve() {
 	w.Write(header)
 	fmt.Println(strings.Join(header, ","))
 
-	fmt.Printf("data %s, dim %d, links %d, wmut %g, state %d, pop %d\n", *dataPath, d.Dim, *links, *wmut, *banks, *pop)
+	fmt.Printf("data %s, dim %d, links %d, wmut %g, state %d, pop %d, score %s\n", *dataPath, d.Dim, *links, *wmut, *banks, *pop, *score)
+	if tr != nil {
+		fmt.Printf("tree of depth %d over %d tokens, input %s (%d values a token)\n", tr.Depth, d.Vocab(), *input, rows.Dim)
+	}
 	printBaselines(d)
 
 	// Ctrl+C lets the generation in flight finish, then validates and saves.
@@ -120,7 +169,7 @@ func runEvolve() {
 	cfg.Pop = *pop
 	// -links counts the bank inputs like the embedding ones: a fresh output
 	// reads that many of all Dim*(1+banks) inputs, drawn at random.
-	p := evo.NewShape(cfg, model.Shape{Dim: d.Dim, Banks: *banks})
+	p := evo.NewShape(cfg, shape)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	sum := prep.Checksum(d)
 	bestVal := math.Inf(1)
@@ -169,7 +218,7 @@ func runEvolve() {
 			val = num(v)
 			if v < bestVal {
 				bestVal = v
-				if err := save(dir, champion{champ, d.Dim, *banks, sum, v, gen}); err != nil {
+				if err := save(dir, champion{champ, d.Dim, *banks, saved, savedIn, sum, v, gen}); err != nil {
 					fail(1, "%v", err)
 				}
 			}

@@ -79,7 +79,7 @@ func runNetrun(dev *vk.Device, d *prep.Data, gs []*neat.Genome, starts []int, le
 		defer sets[c].Close()
 	}
 	err = dev.Submit(func(r *vk.Recorder) {
-		recordNet(r, sets, gen, len(starts), length, warm, d.Dim)
+		recordNet(r, sets, gen, len(starts), length, warm, d.Dim, d.Dim)
 		r.Barrier()
 		r.Copy(out, 0, rowsB, size)
 	})

@@ -288,3 +288,75 @@ func TestNewRejectsDimNotMultipleOf32(t *testing.T) {
 		t.Fatalf("unclear error: %v", err)
 	}
 }
+
+// The tree scoring on the card gives what ref.EvaluateTree gives. 300 tokens
+// make a depth of 9, so the last half of each row is padding.
+func TestTreeEvaluatorMatchesCPU(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 32, 40000, 21)
+	model.Skew(d, 21)
+	tr := model.BuildTree(d)
+	var gs []*neat.Genome
+	for i := range 20 {
+		gs = append(gs, model.GrownShape(int64(i), model.Shape{Dim: 32, Banks: i % 3, Code: tr.Depth}, 40*i))
+	}
+	e, err := NewTree(dev, d, tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	starts := []int{3, 900, 2000, 2500}
+	got, over, err := e.Evaluate(gs, starts, 80, 16)
+	if err != nil || over != 0 {
+		t.Fatal(err, over)
+	}
+	want := ref.EvaluateTree(gs, d, tr, d.Train, starts, 80, 16)
+	for i := range gs {
+		if math.Abs(got[i]-want[i]) > 2e-3*want[i] {
+			t.Fatalf("genome %d: gpu %g cpu %g", i, got[i], want[i])
+		}
+	}
+	v, err := e.Validate(gs[7])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wv := ref.EvaluateTree(gs[7:8], d, tr, d.Val, model.ValStarts(len(d.Val)), model.ValLen, model.Warm)[0]
+	if math.Abs(v-wv) > 2e-3*wv {
+		t.Fatalf("validation: gpu %g cpu %g", v, wv)
+	}
+	// A genome of the softmax shape is refused.
+	if _, _, err := e.Evaluate([]*neat.Genome{model.NewGenome(1, 32)}, starts, 80, 16); err == nil {
+		t.Fatal("a softmax genome was scored by the tree evaluator")
+	}
+}
+
+// Networks that read the path of the token, 9 values wide at 300 tokens, run
+// on the card as on the CPU.
+func TestTreeEvaluatorCodeInput(t *testing.T) {
+	dev := device(t)
+	d := model.Synthetic(300, 32, 3000, 22)
+	tr := model.BuildTree(d)
+	for _, in := range []string{model.InputCode, model.InputBoth} {
+		id := model.InputData(d, tr, in)
+		var gs []*neat.Genome
+		for i := range 10 {
+			gs = append(gs, model.GrownShape(int64(i), model.Shape{Dim: id.Dim, Banks: i % 2, Code: tr.Depth}, 40*i))
+		}
+		e, err := NewTree(dev, id, tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		starts := []int{3, 900, 2000, 2500}
+		got, over, err := e.Evaluate(gs, starts, 80, 16)
+		e.Close()
+		if err != nil || over != 0 {
+			t.Fatal(in, err, over)
+		}
+		want := ref.EvaluateTree(gs, id, tr, id.Train, starts, 80, 16)
+		for i := range gs {
+			if math.Abs(got[i]-want[i]) > 2e-3*want[i] {
+				t.Fatalf("%s genome %d: gpu %g cpu %g", in, i, got[i], want[i])
+			}
+		}
+	}
+}

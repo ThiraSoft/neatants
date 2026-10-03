@@ -102,7 +102,7 @@ func buildGen(flats []*neat.Flat, scales []float32, starts []int) genLayout {
 
 // netPush is the push constant block of netrun.comp.
 type netPush struct {
-	Pairs, Windows, Len, Warm, Dim, StartsOff, GoffOff, ListOff uint32
+	Pairs, Windows, Len, Warm, Dim, StartsOff, GoffOff, ListOff, Outs uint32
 }
 
 // newNetPipes builds the small and the big variant of netrun.
@@ -110,7 +110,7 @@ func newNetPipes(d *vk.Device) ([2]*vk.Pipeline, error) {
 	var p [2]*vk.Pipeline
 	var err error
 	for i, spv := range [][]byte{netrunSPV, netrunBigSPV} {
-		if p[i], err = d.NewPipeline(spv, 4, 8*4); err != nil {
+		if p[i], err = d.NewPipeline(spv, 4, 9*4); err != nil {
 			for _, q := range p {
 				if q != nil {
 					q.Close()
@@ -123,15 +123,16 @@ func newNetPipes(d *vk.Device) ([2]*vk.Pipeline, error) {
 }
 
 // recordNet records the netrun dispatches of a generation, one per variant
-// with work. They write different rows, so they may overlap.
-func recordNet(r *vk.Recorder, sets [2]*vk.Set, gen genLayout, windows, length, warm, dim int) {
+// with work. They write different rows, so they may overlap. outs is the
+// number of prediction outputs of the networks.
+func recordNet(r *vk.Recorder, sets [2]*vk.Set, gen genLayout, windows, length, warm, dim, outs int) {
 	off := gen.listOff
 	for c, n := range gen.pairs {
 		if n == 0 {
 			continue
 		}
 		push := netPush{uint32(n), uint32(windows), uint32(length), uint32(warm), uint32(dim),
-			uint32(gen.startsOff), uint32(gen.goffOff), uint32(off)}
+			uint32(gen.startsOff), uint32(gen.goffOff), uint32(off), uint32(outs)}
 		r.Dispatch(sets[c], uint32(n), unsafe.Pointer(&push))
 		off += n
 	}

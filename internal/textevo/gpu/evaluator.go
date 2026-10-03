@@ -33,6 +33,13 @@ type Evaluator struct {
 	// prior is the unigram log-prior every logit starts from.
 	prior *vk.Buffer
 
+	// tree is set for the tree scoring: treePipe replaces xent, and path and
+	// bias hold its tree. The networks then have tree.Depth predictions.
+	tree       *model.Tree
+	treePipe   *vk.Pipeline
+	path, bias *vk.Buffer
+	treeSet    [2]*vk.Set
+
 	// Growable per-generation buffers, and the sets that bind them, one pair
 	// of sets for each token buffer.
 	up, gen, rows, bits *vk.Buffer
@@ -62,20 +69,23 @@ type Evaluator struct {
 
 // New uploads the corpus and the embedding of data and builds the kernels.
 func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
-	e := &Evaluator{d: d, data: data}
+	return newEvaluator(d, data, nil)
+}
+
+// NewTree is New for the tree scoring with the tree t of data, for genomes
+// with t.Depth predictions.
+func NewTree(d *vk.Device, data *prep.Data, t *model.Tree) (*Evaluator, error) {
+	return newEvaluator(d, data, t)
+}
+
+func newEvaluator(d *vk.Device, data *prep.Data, t *model.Tree) (*Evaluator, error) {
+	e := &Evaluator{d: d, data: data, tree: t}
 	ok := false
 	defer func() {
 		if !ok {
 			e.Close()
 		}
 	}()
-	if data.Dim%2 != 0 {
-		return nil, fmt.Errorf("gpu: the embedding dimension %d must be even", data.Dim)
-	}
-	// The scalar cross-entropy kernel reads the embedding in tiles 32 wide.
-	if data.Dim%32 != 0 {
-		return nil, fmt.Errorf("gpu: the embedding dimension %d must be a multiple of 32", data.Dim)
-	}
 	var err error
 	for i, ids := range [2][]int32{data.Train, data.Val} {
 		w := make([]uint32, max(len(ids), 1))
@@ -89,13 +99,35 @@ func New(d *vk.Device, data *prep.Data) (*Evaluator, error) {
 	if e.emb32, err = upload(d, floats(data.E), vk.UsageStorage); err != nil {
 		return nil, err
 	}
+	if e.netPipe, err = newNetPipes(d); err != nil {
+		return nil, err
+	}
+	// The tree scoring never reads the embedding beyond netrun, so its input
+	// rows may have any width, a path of the tree for one.
+	if t != nil {
+		if e.path, err = upload(d, words(t.Path), vk.UsageStorage); err != nil {
+			return nil, err
+		}
+		if e.bias, err = upload(d, floats(t.Bias), vk.UsageStorage); err != nil {
+			return nil, err
+		}
+		if e.treePipe, err = d.NewPipeline(treeSPV, 6, 7*4); err != nil {
+			return nil, err
+		}
+		ok = true
+		return e, nil
+	}
+	if data.Dim%2 != 0 {
+		return nil, fmt.Errorf("gpu: the embedding dimension %d must be even", data.Dim)
+	}
+	// The scalar cross-entropy kernel reads the embedding in tiles 32 wide.
+	if data.Dim%32 != 0 {
+		return nil, fmt.Errorf("gpu: the embedding dimension %d must be a multiple of 32", data.Dim)
+	}
 	if e.emb16, err = upload(d, words(packHalves(data.E)), vk.UsageStorage); err != nil {
 		return nil, err
 	}
 	if e.prior, err = upload(d, floats(data.Prior()), vk.UsageStorage); err != nil {
-		return nil, err
-	}
-	if e.netPipe, err = newNetPipes(d); err != nil {
 		return nil, err
 	}
 	// The matrix cores take xent when the device has them and the kernel was
@@ -139,18 +171,18 @@ func packHalves(x []float32) []uint32 {
 // Close releases the sets, the pipelines and every buffer.
 func (e *Evaluator) Close() {
 	e.dropSets()
-	for _, p := range []*vk.Pipeline{e.netPipe[0], e.netPipe[1], e.xentPipe} {
+	for _, p := range []*vk.Pipeline{e.netPipe[0], e.netPipe[1], e.xentPipe, e.treePipe} {
 		if p != nil {
 			p.Close()
 		}
 	}
-	e.netPipe, e.xentPipe = [2]*vk.Pipeline{}, nil
-	for _, b := range []*vk.Buffer{e.tokens[0], e.tokens[1], e.emb32, e.emb16, e.prior, e.up, e.gen, e.rows, e.bits} {
+	e.netPipe, e.xentPipe, e.treePipe = [2]*vk.Pipeline{}, nil, nil
+	for _, b := range []*vk.Buffer{e.tokens[0], e.tokens[1], e.emb32, e.emb16, e.prior, e.path, e.bias, e.up, e.gen, e.rows, e.bits} {
 		if b != nil {
 			b.Close()
 		}
 	}
-	e.tokens, e.emb32, e.emb16, e.prior = [2]*vk.Buffer{}, nil, nil, nil
+	e.tokens, e.emb32, e.emb16, e.prior, e.path, e.bias = [2]*vk.Buffer{}, nil, nil, nil, nil, nil
 	e.up, e.gen, e.rows, e.bits = nil, nil, nil, nil
 }
 
@@ -165,6 +197,10 @@ func (e *Evaluator) dropSets() {
 		if e.xentSet[i] != nil {
 			e.xentSet[i].Close()
 			e.xentSet[i] = nil
+		}
+		if e.treeSet[i] != nil {
+			e.treeSet[i].Close()
+			e.treeSet[i] = nil
 		}
 	}
 }
@@ -211,6 +247,12 @@ func (e *Evaluator) grow(upBytes, genBytes, rowBytes, bitBytes int) error {
 				return err
 			}
 		}
+		if e.tree != nil {
+			if e.treeSet[i], err = e.treePipe.NewSet([]*vk.Buffer{e.gen, e.tokens[i], e.path, e.rows, e.bits, e.bias}); err != nil {
+				return err
+			}
+			continue
+		}
 		if e.xentSet[i], err = e.xentPipe.NewSet([]*vk.Buffer{e.gen, e.tokens[i], e.emb16, e.rows, e.bits, e.prior}); err != nil {
 			return err
 		}
@@ -245,8 +287,14 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 	// The kernel finds the banks of a network from its inputs, so a genome
 	// of another shape would read past the embedding row: it is a
 	// programming error, caught here rather than in the packing goroutines.
+	outs := d.Dim
+	if e.tree != nil {
+		outs = e.tree.Depth
+	}
 	for _, g := range gs {
-		model.ShapeOf(g, d.Dim)
+		if p := model.ShapeOf(g, d.Dim).Predictions(); p != outs {
+			return nil, 0, fmt.Errorf("gpu: a genome with %d predictions, the evaluator scores %d", p, outs)
+		}
 	}
 	slots := e.pack(gs, kind == 0)
 	bpb := make([]float64, len(gs))
@@ -264,7 +312,11 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		recs = append(recs, slots[i].rec)
 		class = append(class, slots[i].class)
 		fitIdx = append(fitIdx, i)
-		scales = append(scales, model.LogitScale(gs[i], d.Dim))
+		if e.tree != nil {
+			scales = append(scales, model.TreeScale(gs[i]))
+		} else {
+			scales = append(scales, model.LogitScale(gs[i], d.Dim))
+		}
 	}
 	if len(recs) == 0 {
 		e.Timing.Pack, e.Timing.GPU, e.Timing.Sum = time.Since(start), 0, 0
@@ -278,13 +330,17 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		return nil, 0, fmt.Errorf("gpu: %d genomes x %d windows is %d pairs, over the %d workgroups of one dispatch: lower -pop or -windows",
 			len(recs), len(starts), pairs, maxGroups)
 	}
-	if (rows+e.xentRows-1)/e.xentRows > maxGroups {
+	if e.tree == nil && (rows+e.xentRows-1)/e.xentRows > maxGroups {
 		return nil, 0, fmt.Errorf("gpu: %d rows to score, over what one dispatch of xent covers (%d): lower -pop, -windows or -len",
 			rows, e.xentRows*maxGroups)
 	}
 
 	genBytes := 4 * layoutSize(recs, len(starts))
-	if err := e.grow(genBytes, genBytes, rows*d.Dim*2, rows*4); err != nil {
+	if (rows+treeRows-1)/treeRows > maxGroups {
+		return nil, 0, fmt.Errorf("gpu: %d rows to score, over what one dispatch of tree covers (%d): lower -pop, -windows or -len",
+			rows, treeRows*maxGroups)
+	}
+	if err := e.grow(genBytes, genBytes, rows*((outs+1)/2)*4, rows*4); err != nil {
 		return nil, 0, err
 	}
 	// The records go straight into the staging buffer.
@@ -298,10 +354,14 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 		r.Copy(e.gen, 0, e.up, genBytes)
 		r.TransferBarrier()
 		if !e.skipNet {
-			recordNet(r, e.netSet[kind], gen, len(starts), length, warm, d.Dim)
+			recordNet(r, e.netSet[kind], gen, len(starts), length, warm, d.Dim, outs)
 			r.Barrier()
 		}
-		if !e.skipXent {
+		if !e.skipXent && e.tree != nil {
+			tp := treePush{uint32(rows), uint32(outs), uint32(scored), uint32(len(starts)), uint32(warm),
+				uint32(gen.startsOff), uint32(gen.scaleOff)}
+			r.Dispatch(e.treeSet[kind], uint32((rows+treeRows-1)/treeRows), unsafe.Pointer(&tp))
+		} else if !e.skipXent {
 			groups := uint32((rows + e.xentRows - 1) / e.xentRows)
 			if e.coop {
 				r.DispatchWide(e.xentSet[kind], 1, groups, unsafe.Pointer(&xp))

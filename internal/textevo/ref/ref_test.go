@@ -121,3 +121,51 @@ func TestStateSeesThePast(t *testing.T) {
 	}
 	t.Logf("o[0] after the token: %v", []float32{loud[0][0], loud[3][0], loud[6][0], loud[11][0]})
 }
+
+// The tree scoring is a distribution over the tokens whatever the outputs,
+// and with zero outputs it is the add-one unigram, as the softmax is.
+func TestTreeBitsIsADistribution(t *testing.T) {
+	d := model.Synthetic(300, 16, 3000, 12)
+	model.Skew(d, 12)
+	tr := model.BuildTree(d)
+	zero := make([]float32, tr.Depth)
+	o := make([]float32, tr.Depth)
+	for k := range o {
+		o[k] = float32(math.Sin(float64(3*k + 1)))
+	}
+	sum := 0.0
+	for id := range int32(d.Vocab()) {
+		if z := TreeBits(tr, zero, 7, id); math.Abs(z-model.UnigramBits(d, id)) > 1e-6 {
+			t.Fatalf("token %d: zero output %g bits, unigram %g", id, z, model.UnigramBits(d, id))
+		}
+		sum += math.Exp2(-TreeBits(tr, o, 7, id))
+	}
+	if math.Abs(sum-1) > 1e-6 {
+		t.Fatalf("probabilities sum to %g", sum)
+	}
+}
+
+func TestEvaluateTree(t *testing.T) {
+	d := model.Synthetic(50, 8, 400, 4)
+	tr := model.BuildTree(d)
+	s := model.Shape{Dim: 8, Banks: 1, Code: tr.Depth}
+	gs := []*neat.Genome{model.GrownShape(1, s, 100), model.GrownShape(2, s, 100)}
+	starts := []int{0, 100, 200}
+	bpb := EvaluateTree(gs, d, tr, d.Train, starts, 64, 16)
+	for i, g := range gs {
+		bits := 0.0
+		for _, st := range starts {
+			rows := Rows(g, d, d.Train, st, 64, 16)
+			if len(rows[0]) != tr.Depth {
+				t.Fatalf("%d values a row, want %d", len(rows[0]), tr.Depth)
+			}
+			for r, o := range rows {
+				bits += TreeBits(tr, o, model.TreeScale(g), d.Train[st+16+r+1])
+			}
+		}
+		want := bits / float64(model.WindowBytes(d, d.Train, starts, 64, 16))
+		if math.Abs(bpb[i]-want) > 1e-9 {
+			t.Fatalf("genome %d: %g, want %g", i, bpb[i], want)
+		}
+	}
+}

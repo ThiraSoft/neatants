@@ -35,6 +35,9 @@ var (
 	dataPath  = flag.String("data", "data/prep.bin", "prepared corpus: written by -prep, read by every other mode")
 	baselines = flag.Bool("baselines", false, "print the n-gram baselines in bits per byte")
 	sampleOf  = flag.String("sample", "", "champion JSON to write text with")
+	esOf      = flag.String("es", "", "softmax champion JSON whose link weights OpenAI-ES tunes, its topology fixed (-pop perturbations a step)")
+	esSigma   = flag.Float64("es-sigma", 0.05, "-es: standard deviation of the weight perturbations")
+	esLR      = flag.Float64("es-lr", 0.01, "-es: Adam step size")
 	gguf      = flag.String("gguf", "/mnt/data/LLMs_models/unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-BF16.gguf", "Qwen model: tokenizer and embeddings")
 	dim       = flag.Int("dim", 128, "-prep only: embedding dimensions kept by the PCA (multiple of 32); the other modes use the file's")
 	pop       = flag.Int("pop", 1000, "population size")
@@ -45,6 +48,8 @@ var (
 	hebb      = flag.Float64("hebb", neat.HebbRate, "rate at which a mutation makes a link plastic")
 	links     = flag.Int("links", neat.MinimalLinks, "inputs each output reads in a first-generation genome (the dim for a dense map)")
 	wmut      = flag.Float64("wmut", neat.WeightsPerMutation, "weights a mutation perturbs on average")
+	score     = flag.String("score", "softmax", "how a prediction is scored: softmax over the vocabulary, or tree, one binary decision a level of a tree of the tokens")
+	input     = flag.String("input", "emb", "-score tree only: what a network reads of a token, emb (its embedding), code (its path in the tree) or both")
 	banks     = flag.Int("state", 0, "state banks every network reads, 0 to 4: running averages of the embeddings at four time scales, written through gates")
 	cpu       = flag.Bool("cpu", false, "evaluate on the CPU reference instead of the GPU")
 	out       = flag.String("out", "", "run directory (default runs/<date-time>)")
@@ -58,6 +63,8 @@ type champion struct {
 	Genome   *neat.Genome `json:"genome"`
 	Dim      int          `json:"dim"`
 	Banks    int          `json:"banks"`
+	Score    string       `json:"score,omitempty"` // "tree", or empty for softmax
+	Input    string       `json:"input,omitempty"` // under tree: "code" or "both", or empty for the embedding
 	Checksum uint64       `json:"checksum"`
 	ValBPB   float64      `json:"val_bpb"`
 	Gen      int          `json:"gen"`
@@ -78,6 +85,8 @@ func main() {
 		printBaselines(d)
 	case *sampleOf != "":
 		runSample()
+	case *esOf != "":
+		runES()
 	default:
 		runEvolve()
 	}
@@ -157,7 +166,27 @@ func runSample() {
 	// The genome's inputs say how many banks it reads; a champion that
 	// disagrees with its own record was not written by this program.
 	in, out := c.Genome.NumInputs, c.Genome.NumOutputs
-	if s := (model.Shape{Dim: c.Dim, Banks: c.Banks}); c.Banks < 0 || c.Banks > model.MaxBanks || in != s.Inputs() || out != s.Outputs() {
+	var tr *model.Tree
+	rows := d
+	switch c.Score {
+	case "":
+	case "tree":
+		tr = model.BuildTree(d)
+		switch c.Input {
+		case "":
+		case model.InputCode, model.InputBoth:
+			rows = model.InputData(d, tr, c.Input)
+		default:
+			fail(1, "%s: unknown input %q", *sampleOf, c.Input)
+		}
+	default:
+		fail(1, "%s: unknown score %q", *sampleOf, c.Score)
+	}
+	s := model.Shape{Dim: rows.Dim, Banks: c.Banks}
+	if tr != nil && tr.Depth != rows.Dim {
+		s.Code = tr.Depth
+	}
+	if c.Banks < 0 || c.Banks > model.MaxBanks || in != s.Inputs() || out != s.Outputs() {
 		fail(1, "%s: a genome of %d inputs and %d outputs is not a network of dim %d with %d state banks", *sampleOf, in, out, c.Dim, c.Banks)
 	}
 	g, voc := openModel()
@@ -168,7 +197,7 @@ func runSample() {
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	text := *prompt
-	for _, id := range sample(c.Genome, d, ids, *n, *temp, rng) {
+	for _, id := range sample(c.Genome, rows, tr, ids, *n, *temp, rng) {
 		text += voc.Decode([]int32{d.QwenID[id]}, false)
 	}
 	fmt.Println(text)

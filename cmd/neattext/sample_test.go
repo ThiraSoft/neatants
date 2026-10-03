@@ -1,12 +1,14 @@
 package main
 
 import (
+	"math"
 	"math/rand"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/ThiraSoft/neatants/internal/textevo/model"
+	"github.com/ThiraSoft/neatants/internal/textevo/ref"
 )
 
 // fakeEnc is a tokenizer reduced to a lookup table.
@@ -38,7 +40,7 @@ func TestEncodePromptRejectsUnknownTokens(t *testing.T) {
 func TestSampleLength(t *testing.T) {
 	d := model.Synthetic(10, 8, 50, 1)
 	g := model.Grown(1, 8, 50)
-	out := sample(g, d, []int32{1, 2}, 30, 1, rand.New(rand.NewSource(1)))
+	out := sample(g, d, nil, []int32{1, 2}, 30, 1, rand.New(rand.NewSource(1)))
 	if len(out) != 30 {
 		t.Fatal(len(out))
 	}
@@ -54,7 +56,7 @@ func TestSampleLength(t *testing.T) {
 func TestSampleWithState(t *testing.T) {
 	d := model.Synthetic(10, 8, 50, 1)
 	g := model.GrownShape(1, model.Shape{Dim: 8, Banks: 2}, 50)
-	got := sample(g, d, []int32{1, 2}, 30, 1, rand.New(rand.NewSource(1)))
+	got := sample(g, d, nil, []int32{1, 2}, 30, 1, rand.New(rand.NewSource(1)))
 	rng := rand.New(rand.NewSource(1))
 	net := model.NewNet(g, 8)
 	o := make([]float32, 8)
@@ -82,6 +84,27 @@ func TestLogitsStartFromThePrior(t *testing.T) {
 	for j, p := range d.Prior() {
 		if got[j] != float64(p) {
 			t.Fatalf("token %d: logit %g, prior %g", j, got[j], p)
+		}
+	}
+}
+
+// Down the tree at temperature 1, tokens come out as often as the scoring
+// says they should.
+func TestDescendFollowsTreeBits(t *testing.T) {
+	d := model.Synthetic(13, 8, 500, 3)
+	model.Skew(d, 3)
+	tr := model.BuildTree(d)
+	o := []float32{0.3, -0.8, 0.5, 0.1}
+	rng := rand.New(rand.NewSource(4))
+	const n = 200000
+	seen := make([]int, d.Vocab())
+	for range n {
+		seen[descend(tr, o, 2, 1, rng)]++
+	}
+	for id, c := range seen {
+		p := math.Exp2(-ref.TreeBits(tr, o, 2, int32(id)))
+		if got := float64(c) / n; math.Abs(got-p) > 4*math.Sqrt(p*(1-p)/n)+1e-4 {
+			t.Fatalf("token %d drawn %.4f of the time, scored %.4f", id, got, p)
 		}
 	}
 }

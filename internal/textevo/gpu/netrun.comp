@@ -46,6 +46,7 @@ layout(push_constant) uniform Push {
 	uint startsOff;
 	uint goffOff;
 	uint listOff;
+	uint outs; // prediction outputs: dim, or the depth of the tree scoring
 } pc;
 
 #define MAX_BANKS 4u
@@ -144,7 +145,9 @@ void main() {
 	uint lastE = max(nEdges, 1u) - 1u, lastJ = max(nOrder, 1u) - 1u;
 	uint start = gw[pc.startsOff + w];
 	uint scored = pc.len - pc.warm;
-	uint hd = pc.dim / 2u;
+	// A row is the predictions in halves, two to a word, the last one
+	// padded with zero when there is an odd number of them.
+	uint ho = (pc.outs + 1u) / 2u;
 	// The state banks are inputs after the embedding (see model.Shape), so
 	// the record says how many a network has.
 	uint banks = (inEnd - inStart) / pc.dim - 1u;
@@ -162,7 +165,7 @@ void main() {
 		float rate[MAX_BANKS];
 		for (uint b = 0u; b < MAX_BANKS; b++) {
 			float gt = 0.5;
-			if (t > 0u && b < banks) gt = v[outStart + pc.dim + b];
+			if (t > 0u && b < banks) gt = v[outStart + pc.outs + b];
 			precise float r = (1.0 - DECAY[b]) * 2.0 * gt;
 			rate[b] = r;
 		}
@@ -230,10 +233,11 @@ void main() {
 		}
 
 		if (t >= pc.warm) {
-			uint r = (p * scored + (t - pc.warm)) * hd;
-			for (uint j = lane; j < hd; j += LANES) {
+			uint r = (p * scored + (t - pc.warm)) * ho;
+			for (uint j = lane; j < ho; j += LANES) {
 				uint o = outStart + 2u * j;
-				rows[r + j] = packHalf2x16(vec2(2.0 * v[o] - 1.0, 2.0 * v[o + 1u] - 1.0));
+				float hi = 2u * j + 1u < pc.outs ? 2.0 * v[o + 1u] - 1.0 : 0.0;
+				rows[r + j] = packHalf2x16(vec2(2.0 * v[o] - 1.0, hi));
 			}
 		}
 		for (uint q = lane; q < nPlastic; q += LANES) {

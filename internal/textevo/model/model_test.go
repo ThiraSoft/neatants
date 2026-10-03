@@ -94,17 +94,21 @@ func TestShape(t *testing.T) {
 	if got := ShapeOf(g, 8); got != s {
 		t.Fatalf("ShapeOf %+v", got)
 	}
-	if got := ShapeOf(NewGenome(1, 8), 8); got != (Shape{8, 0}) {
+	if got := ShapeOf(NewGenome(1, 8), 8); got != (Shape{Dim: 8}) {
 		t.Fatalf("plain genome: %+v", got)
+	}
+	code := Shape{Dim: 8, Banks: 2, Code: 5}
+	if g := NewGenomeShape(1, code); g.NumOutputs != 7 || ShapeOf(g, 8) != code {
+		t.Fatalf("tree genome: %d outputs, ShapeOf %+v", g.NumOutputs, ShapeOf(g, 8))
 	}
 	bad := []struct {
 		g   *neat.Genome
 		dim int
 	}{
-		{neat.NewGenome(1, 8, 9), 8},        // a gate output without its bank
-		{neat.NewGenome(1, 20, 8), 8},       // inputs not a whole number of banks
-		{NewGenomeShape(1, Shape{8, 1}), 4}, // read at another dimension
-		{neat.NewGenome(1, 48, 13), 8},      // more banks than decays
+		{neat.NewGenome(1, 8, 9), 8},                    // a gate output without its bank
+		{neat.NewGenome(1, 20, 8), 8},                   // inputs not a whole number of banks
+		{NewGenomeShape(1, Shape{Dim: 8, Banks: 1}), 4}, // read at another dimension
+		{neat.NewGenome(1, 48, 13), 8},                  // more banks than decays
 	}
 	for _, b := range bad {
 		func() {

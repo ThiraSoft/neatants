@@ -57,3 +57,14 @@ func newXentPipe(d *vk.Device, coopDim int, wave uint32) (*vk.Pipeline, error) {
 	}
 	return p, nil
 }
+
+//go:embed tree.spv
+var treeSPV []byte
+
+// treePush is the push constant block of tree.comp.
+type treePush struct {
+	Rows, Depth, Scored, Windows, Warm, StartsOff, ScaleOff uint32
+}
+
+// treeRows is how many rows one workgroup of tree.comp covers.
+const treeRows = 64

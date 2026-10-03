@@ -1,0 +1,47 @@
+#version 450
+// bits[r] = -log2 of the probability the tree scoring gives target_r, as
+// ref.TreeBits: one thread a row walks the path of its target, level k
+// decided by z = s_g * o_k + bias[node], the second child having probability
+// sigmoid(z). A row costs a few sigmoids where xent costs the whole
+// vocabulary.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
+layout(std430, binding = 1) readonly buffer Tokens { uint tokens[]; };
+layout(std430, binding = 2) readonly buffer Path { uint path[]; };  // Depth words a token, model.Tree.Path
+layout(std430, binding = 3) readonly buffer Rows { uint rows[]; };  // halves, R x ceil(Depth/2) words
+layout(std430, binding = 4) writeonly buffer Bits { float bits[]; };
+layout(std430, binding = 5) readonly buffer Bias { float bias[]; };
+
+layout(push_constant) uniform Push {
+	uint rows;
+	uint depth;
+	uint scored;
+	uint windows;
+	uint warm;
+	uint startsOff;
+	uint scaleOff;
+} pc;
+
+void main() {
+	uint r = gl_GlobalInvocationID.x;
+	if (r >= pc.rows) return;
+	uint p = r / pc.scored;
+	uint g = p / pc.windows, w = p % pc.windows;
+	uint t = pc.warm + r % pc.scored;
+	float scale = uintBitsToFloat(gw[pc.scaleOff + g]);
+	uint target = tokens[gw[pc.startsOff + w] + t + 1u];
+	uint ho = (pc.depth + 1u) / 2u;
+	float b = 0.0;
+	for (uint k = 0u; k < pc.depth; k++) {
+		uint s = path[target * pc.depth + k];
+		if (s == 0xFFFFFFFFu) break;
+		vec2 h = unpackHalf2x16(rows[r * ho + k / 2u]);
+		float z = scale * ((k & 1u) == 0u ? h.x : h.y) + bias[s & 0x7FFFFFFFu];
+		if ((s & 0x80000000u) != 0u) z = -z;
+		// -ln sigmoid(-z) = softplus(z), written so it never overflows.
+		b += max(z, 0.0) + log(1.0 + exp(-abs(z)));
+	}
+	bits[r] = b / 0.69314718055994530942;
+}

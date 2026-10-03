@@ -22,7 +22,7 @@ const (
 // NewGenome returns a minimal genome mapping a dim embedding to a dim output,
 // with one heritable trait: the logit scale. It has no state bank.
 func NewGenome(id, dim int) *neat.Genome {
-	return NewGenomeShape(id, Shape{dim, 0})
+	return NewGenomeShape(id, Shape{Dim: dim})
 }
 
 // Scale is the logit temperature s = 1 + 19*Traits[0], or its midpoint when
@@ -38,6 +38,18 @@ func Scale(g *neat.Genome) float64 {
 // kernels use it.
 func LogitScale(g *neat.Genome, dim int) float32 {
 	return float32(Scale(g) / math.Sqrt(float64(dim)))
+}
+
+// TreeScale is the scale of the tree scoring, 0.05*400^Traits[0], from 0.05
+// to 20 on a log scale, or 1 when the genome carries no trait. A linear range
+// from 1 was too sure of itself: at D32 the evolution pushed the trait to its
+// floor and still scored worse than the unigram.
+func TreeScale(g *neat.Genome) float32 {
+	t := 0.5
+	if len(g.Traits) > 0 {
+		t = g.Traits[0]
+	}
+	return float32(0.05 * math.Pow(400, t))
 }
 
 // DrawStarts returns k window starts drawn uniformly so that a window of
