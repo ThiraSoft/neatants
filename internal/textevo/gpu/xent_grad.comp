@@ -1,0 +1,187 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_control_flow_attributes : enable
+// Fused loss and gradient of xent.comp, for 64 rows per workgroup:
+//   bits[r] = (logsumexp_j x_j - x_t) / ln2
+//   dO[r]   = s * (sum_j p_j e_j - e_t) / ln2     (Dim floats)
+//   dS[r]   = (sum_j p_j dot_j - dot_t) / ln2
+// with x_j = prior_j + s * dot_j, dot_j = e_j . o_r and p = softmax(x).
+// One pass over the vocabulary in tiles of 64 columns, flash-attention style:
+// a tile of logits is computed with the same matrix product as xent.comp, the
+// running max M of the row grows, and the running sums S = sum exp(x-M),
+// B = sum exp(x-M) dot and the Dim-vector A = sum exp(x-M) e are rescaled by
+// exp(Mold-Mnew) before the tile is added. A tile of P = exp(x-M) goes through
+// shared memory for the second product P * E, whose result thread (ty, tx)
+// keeps for its 4 rows and the dims tx + 16 j. The 16 threads of a row are
+// aligned lanes of a wave and merge by shuffles, so the max is the same for
+// all of them at every tile. Dim is a multiple of 32 up to 128.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
+layout(std430, binding = 1) readonly buffer Tokens { uint tokens[]; };
+layout(std430, binding = 2) readonly buffer Emb { uint emb[]; };   // halves, Vocab x Dim
+layout(std430, binding = 3) readonly buffer Rows { uint rows[]; }; // halves, R x Dim
+layout(std430, binding = 4) writeonly buffer Bits { float bits[]; };
+layout(std430, binding = 5) readonly buffer Prior { float prior[]; };
+layout(std430, binding = 6) writeonly buffer DO { float dO[]; };   // R x Dim
+layout(std430, binding = 7) writeonly buffer DS { float dS[]; };   // R
+
+layout(push_constant) uniform Push {
+	uint rows;
+	uint vocab;
+	uint dim;
+	uint scored;
+	uint windows;
+	uint warm;
+	uint startsOff;
+	uint scaleOff;
+} pc;
+
+#define TR 64u
+#define TC 64u
+#define DK 32u
+#define LN2 0.69314718055994530942
+
+shared float As[TR][DK + 1u];
+shared float Bs[TC][DK + 1u];
+shared float Ps[TR][TC + 1u];
+
+float half_at(uint w, uint d) {
+	return unpackHalf2x16(w)[d & 1u];
+}
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	uint ty = tid / 16u, tx = tid % 16u;
+	uint r0 = gl_WorkGroupID.x * TR;
+	uint hd = pc.dim / 2u;
+
+	float scale[4];
+	uint target[4];
+	float m[4], s[4], bsum[4];
+	float A[4][8];
+	for (uint i = 0u; i < 4u; i++) {
+		uint r = min(r0 + ty * 4u + i, pc.rows - 1u);
+		uint p = r / pc.scored;
+		uint g = p / pc.windows, w = p % pc.windows;
+		uint t = pc.warm + r % pc.scored;
+		scale[i] = uintBitsToFloat(gw[pc.scaleOff + g]);
+		target[i] = tokens[gw[pc.startsOff + w] + t + 1u];
+		m[i] = -1e30;
+		s[i] = 0.0;
+		bsum[i] = 0.0;
+		for (uint j = 0u; j < 8u; j++) A[i][j] = 0.0;
+	}
+
+	for (uint c0 = 0u; c0 < pc.vocab; c0 += TC) {
+		float acc[4][4];
+		for (uint i = 0u; i < 4u; i++) for (uint j = 0u; j < 4u; j++) acc[i][j] = 0.0;
+		for (uint k0 = 0u; k0 < pc.dim; k0 += DK) {
+			for (uint q = tid; q < TR * DK / 2u; q += 256u) {
+				uint rr = q / (DK / 2u), kk = q % (DK / 2u);
+				uint ra = min(r0 + rr, pc.rows - 1u);
+				vec2 a = unpackHalf2x16(rows[ra * hd + k0 / 2u + kk]);
+				As[rr][2u * kk] = a.x;
+				As[rr][2u * kk + 1u] = a.y;
+				uint cb = min(c0 + rr, pc.vocab - 1u);
+				vec2 e = unpackHalf2x16(emb[cb * hd + k0 / 2u + kk]);
+				Bs[rr][2u * kk] = e.x;
+				Bs[rr][2u * kk + 1u] = e.y;
+			}
+			barrier();
+			for (uint k = 0u; k < DK; k++) {
+				float a[4], bb[4];
+				for (uint i = 0u; i < 4u; i++) a[i] = As[ty * 4u + i][k];
+				for (uint j = 0u; j < 4u; j++) bb[j] = Bs[tx + 16u * j][k];
+				for (uint i = 0u; i < 4u; i++) for (uint j = 0u; j < 4u; j++) acc[i][j] += a[i] * bb[j];
+			}
+			barrier();
+		}
+		// Logits, the new max of each row, and the rescaling.
+		for (uint i = 0u; i < 4u; i++) {
+			float x[4];
+			float tm = -1e30;
+			for (uint j = 0u; j < 4u; j++) {
+				uint c = c0 + tx + 16u * j;
+				x[j] = c < pc.vocab ? prior[c] + acc[i][j] * scale[i] : -1e30;
+				tm = max(tm, x[j]);
+			}
+			tm = max(tm, subgroupShuffleXor(tm, 1u));
+			tm = max(tm, subgroupShuffleXor(tm, 2u));
+			tm = max(tm, subgroupShuffleXor(tm, 4u));
+			tm = max(tm, subgroupShuffleXor(tm, 8u));
+			float mn = max(m[i], tm);
+			float alpha = exp(m[i] - mn);
+			s[i] *= alpha;
+			bsum[i] *= alpha;
+			for (uint j = 0u; j < 8u; j++) A[i][j] *= alpha;
+			for (uint j = 0u; j < 4u; j++) {
+				float p = exp(x[j] - mn);
+				s[i] += p;
+				bsum[i] += p * acc[i][j];
+				Ps[ty * 4u + i][tx + 16u * j] = p;
+			}
+			m[i] = mn;
+		}
+		barrier();
+		// A += P * E, 32 dims of E at a time through Bs.
+		[[unroll]] for (uint kc = 0u; kc < 4u; kc++) {
+			if (kc * DK >= pc.dim) break;
+			for (uint q = tid; q < TC * DK / 2u; q += 256u) {
+				uint rr = q / (DK / 2u), kk = q % (DK / 2u);
+				uint cb = min(c0 + rr, pc.vocab - 1u);
+				vec2 e = unpackHalf2x16(emb[cb * hd + kc * DK / 2u + kk]);
+				Bs[rr][2u * kk] = e.x;
+				Bs[rr][2u * kk + 1u] = e.y;
+			}
+			barrier();
+			for (uint c = 0u; c < TC; c++) {
+				float pv[4];
+				for (uint i = 0u; i < 4u; i++) pv[i] = Ps[ty * 4u + i][c];
+				float e0 = Bs[c][tx], e1 = Bs[c][tx + 16u];
+				for (uint i = 0u; i < 4u; i++) {
+					A[i][2u * kc] += pv[i] * e0;
+					A[i][2u * kc + 1u] += pv[i] * e1;
+				}
+			}
+			barrier();
+		}
+	}
+
+	for (uint i = 0u; i < 4u; i++) {
+		uint r = r0 + ty * 4u + i;
+		uint rc = min(r, pc.rows - 1u);
+		float S = s[i], B = bsum[i];
+		S += subgroupShuffleXor(S, 1u); B += subgroupShuffleXor(B, 1u);
+		S += subgroupShuffleXor(S, 2u); B += subgroupShuffleXor(B, 2u);
+		S += subgroupShuffleXor(S, 4u); B += subgroupShuffleXor(B, 4u);
+		S += subgroupShuffleXor(S, 8u); B += subgroupShuffleXor(B, 8u);
+		// The target embedding for the dims this thread owns, and the dot.
+		float et[8];
+		float dt = 0.0;
+		for (uint j = 0u; j < 8u; j++) {
+			uint d = tx + 16u * j;
+			et[j] = 0.0;
+			if (d < pc.dim) {
+				et[j] = half_at(emb[target[i] * hd + d / 2u], d);
+				dt += et[j] * half_at(rows[rc * hd + d / 2u], d);
+			}
+		}
+		dt += subgroupShuffleXor(dt, 1u);
+		dt += subgroupShuffleXor(dt, 2u);
+		dt += subgroupShuffleXor(dt, 4u);
+		dt += subgroupShuffleXor(dt, 8u);
+		float xt = prior[target[i]] + scale[i] * dt;
+		if (r < pc.rows) {
+			for (uint j = 0u; j < 8u; j++) {
+				uint d = tx + 16u * j;
+				if (d < pc.dim) dO[r * pc.dim + d] = scale[i] * (A[i][j] / S - et[j]) / LN2;
+			}
+			if (tx == 0u) {
+				bits[r] = (m[i] + log(S) - xt) / LN2;
+				dS[r] = (B / S - dt) / LN2;
+			}
+		}
+	}
+}

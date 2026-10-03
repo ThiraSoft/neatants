@@ -1,0 +1,298 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+// xent_grad.comp on the matrix cores, in the frame of xent_coop.comp: bits, dO
+// and dS of each row, see xent_grad.comp for what they are. Two passes over the
+// vocabulary. The first is xent_coop's: the max and the sum of each row, and
+// the target logit. The second recomputes each tile of logits with the same
+// products, turns it into P = softmax (no rescaling, the max and the sum being
+// known), keeps B = sum P dot in the lanes, and runs the products P * E on the
+// matrix cores into 16 x DIM accumulators per block of rows. The tile of P goes
+// to shared memory as halves over the logits it came from, in the rows of the
+// wave that made it.
+// A workgroup is four waves; each wave owns RB blocks of 16 rows, keeps their
+// operand in registers for the whole vocabulary, and multiplies it by four
+// 16-column blocks of the staged embedding, so that every block of the
+// embedding it reads from shared memory feeds RB products. The result goes
+// through shared memory so that four lanes a row can run the online max and
+// sum, in base 2 so that the exponential is a single instruction.
+
+#ifndef DIM
+#define DIM 128
+#endif
+#ifndef RB
+#define RB 2u
+#endif
+#define THREADS 256u
+#define TR (64u * RB)
+#define TC 64u
+// A shared row is DIM halves seen as DIM/8 sixteen-byte words, plus one word
+// so that the rows of a column-major load do not fall on the same banks.
+#define RW (DIM / 8 + 1)
+// The same row of logits as vec4 (TC / 4 of them), plus one.
+#define SW (TC / 4u + 1u)
+
+layout(local_size_x = THREADS) in;
+
+layout(std430, binding = 0) readonly buffer Gen { uint gw[]; };
+layout(std430, binding = 1) readonly buffer Tokens { uint tokens[]; };
+layout(std430, binding = 2) readonly buffer Emb { uvec4 emb[]; };   // halves, Vocab x Dim
+layout(std430, binding = 3) readonly buffer Rows { uvec4 rows[]; }; // halves, R x Dim
+layout(std430, binding = 4) writeonly buffer Bits { float bits[]; };
+layout(std430, binding = 5) readonly buffer Prior { float prior[]; };
+layout(std430, binding = 6) writeonly buffer DO { float dO[]; };
+layout(std430, binding = 7) writeonly buffer DS { float dS[]; };
+
+layout(push_constant) uniform Push {
+	uint rows;
+	uint vocab;
+	uint dim;
+	uint scored;
+	uint windows;
+	uint warm;
+	uint startsOff;
+	uint scaleOff;
+} pc;
+
+shared uvec4 Bs[TC * RW];
+// The prior of the staged columns in base 2, seen as vec4 the way a lane
+// reads its logits. A column past the vocabulary gets -1e30, which masks it
+// whatever its product.
+shared vec4 Ps[TC / 4u];
+// The operand is read into registers once, before the first logits are stored,
+// so its staging area and the logits share their memory, sized for the wider
+// of the two: under DIM 128 a row of logits is wider than a row of operand.
+#define SSW (uint(RW) > SW ? uint(RW) : SW)
+shared vec4 Ss[TR * SSW];
+
+const float LOG2E = 1.44269504088896340736;
+const float LN2 = 0.69314718055994530942;
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	if (gl_SubgroupSize != 64u || gl_NumSubgroups != THREADS / 64u) {
+		for (uint q = tid; q < TR; q += THREADS)
+			if (gl_WorkGroupID.x * TR + q < pc.rows) bits[gl_WorkGroupID.x * TR + q] = uintBitsToFloat(0x7FC00000u);
+		return;
+	}
+	uint wave = gl_SubgroupID;
+	uint lane = gl_SubgroupInvocationID;
+	uint slot = wave * 64u + lane;
+	uint r0 = gl_WorkGroupID.x * TR;
+	uint part = lane & 3u;
+	const uint wv = DIM / 8;
+
+	for (uint q = tid; q < TR * wv; q += THREADS) {
+		uint row = q / wv, kk = q % wv;
+		Ss[row * RW + kk] = uintBitsToFloat(rows[min(r0 + row, pc.rows - 1u) * wv + kk]);
+	}
+	barrier();
+	coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[RB][DIM / 16];
+	[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+		[[unroll]] for (uint k = 0u; k < DIM / 16; k++)
+			coopMatLoad(a[ib][k], Ss, (wave * RB + ib) * 16u * RW + 2u * k, RW, gl_CooperativeMatrixLayoutRowMajor);
+
+	// scale is the scale of the genome times log2(e); dt the plain dot of the
+	// target, which only the first lane of a row has before the merge.
+	float scale[RB], m[RB], s[RB], tg[RB], dt[RB];
+	uint target[RB];
+	[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
+		uint r = (wave * RB + ib) * 16u + (lane >> 2);
+		uint rr = min(r0 + r, pc.rows - 1u);
+		uint p = rr / pc.scored;
+		uint g = p / pc.windows, w = p % pc.windows;
+		uint t = pc.warm + rr % pc.scored;
+		scale[ib] = uintBitsToFloat(gw[pc.scaleOff + g]) * LOG2E;
+		target[ib] = tokens[gw[pc.startsOff + w] + t + 1u];
+		m[ib] = -1e30;
+		s[ib] = 0.0;
+		tg[ib] = -1e30;
+		dt[ib] = 0.0;
+		if (part == 0u) {
+			float d = 0.0;
+			for (uint kk = 0u; kk < wv; kk++) {
+				uvec4 x = floatBitsToUint(Ss[r * RW + kk]);
+				uvec4 e = emb[target[ib] * wv + kk];
+				d += dot(unpackHalf2x16(x.x), unpackHalf2x16(e.x)) + dot(unpackHalf2x16(x.y), unpackHalf2x16(e.y))
+					+ dot(unpackHalf2x16(x.z), unpackHalf2x16(e.z)) + dot(unpackHalf2x16(x.w), unpackHalf2x16(e.w));
+			}
+			dt[ib] = d;
+			tg[ib] = d * scale[ib] + prior[target[ib]] * LOG2E;
+		}
+	}
+
+	// Pass 1: max and sum.
+	for (uint c0 = 0u; c0 < pc.vocab; c0 += TC) {
+		barrier();
+		for (uint q = tid; q < TC * wv; q += THREADS) {
+			uint row = q / wv, kk = q % wv;
+			Bs[row * RW + kk] = emb[min(c0 + row, pc.vocab - 1u) * wv + kk];
+		}
+		if (tid < TC) Ps[tid >> 2][tid & 3u] = c0 + tid < pc.vocab ? prior[c0 + tid] * LOG2E : -1e30;
+		barrier();
+		[[unroll]] for (uint j = 0u; j < 4u; j++) {
+			coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[RB];
+			[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+				acc[ib] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+			[[unroll]] for (uint k = 0u; k < DIM / 16; k++) {
+				coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+				coopMatLoad(b, Bs, j * 16u * RW + 2u * k, RW, gl_CooperativeMatrixLayoutColumnMajor);
+				[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+					acc[ib] = coopMatMulAdd(a[ib][k], b, acc[ib]);
+			}
+			[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+				coopMatStore(acc[ib], Ss, (wave * RB + ib) * 16u * SW + j * 4u, SW, gl_CooperativeMatrixLayoutRowMajor);
+		}
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
+			uint r = (wave * RB + ib) * 16u + (lane >> 2);
+			vec4 x[4];
+			[[unroll]] for (uint c = 0u; c < 4u; c++) x[c] = Ss[r * SW + c * 4u + part] * scale[ib] + Ps[c * 4u + part];
+			vec4 mx = max(max(x[0], x[1]), max(x[2], x[3]));
+			float tm = max(m[ib], max(max(mx.x, mx.y), max(mx.z, mx.w)));
+			s[ib] *= exp2(m[ib] - tm);
+			[[unroll]] for (uint c = 0u; c < 4u; c++) {
+				vec4 y = exp2(x[c] - tm);
+				s[ib] += (y.x + y.y) + (y.z + y.w);
+			}
+			m[ib] = tm;
+		}
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+	}
+
+	// Merge the four lanes of a row: all four end with the max, the sum, the
+	// target logit and the target dot of the row.
+	[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
+		uint r = (wave * RB + ib) * 16u + (lane >> 2);
+		float M = m[ib], T = tg[ib], S = s[ib], DT = dt[ib];
+		for (uint o = 1u; o < 4u; o <<= 1u) {
+			barrier();
+			Ss[slot] = vec4(M, T, S, DT);
+			barrier();
+			vec4 o2 = Ss[slot ^ o];
+			float Mn = max(M, o2.x);
+			S = S * exp2(M - Mn) + o2.z * exp2(o2.x - Mn);
+			M = Mn;
+			T = max(T, o2.y);
+			DT += o2.w;
+		}
+		m[ib] = M;
+		s[ib] = 1.0 / S;
+		dt[ib] = DT;
+		if (part == 0u && r0 + r < pc.rows) bits[r0 + r] = M + log2(S) - T;
+	}
+
+	// Pass 2: P, B and P * E.
+	coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dacc[RB][DIM / 16];
+	[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+		[[unroll]] for (uint n = 0u; n < DIM / 16; n++)
+			dacc[ib][n] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+	float bsum[RB];
+	[[unroll]] for (uint ib = 0u; ib < RB; ib++) bsum[ib] = 0.0;
+
+	for (uint c0 = 0u; c0 < pc.vocab; c0 += TC) {
+		barrier();
+		for (uint q = tid; q < TC * wv; q += THREADS) {
+			uint row = q / wv, kk = q % wv;
+			Bs[row * RW + kk] = emb[min(c0 + row, pc.vocab - 1u) * wv + kk];
+		}
+		if (tid < TC) Ps[tid >> 2][tid & 3u] = c0 + tid < pc.vocab ? prior[c0 + tid] * LOG2E : -1e30;
+		barrier();
+		[[unroll]] for (uint j = 0u; j < 4u; j++) {
+			coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[RB];
+			[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+				acc[ib] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+			[[unroll]] for (uint k = 0u; k < DIM / 16; k++) {
+				coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+				coopMatLoad(b, Bs, j * 16u * RW + 2u * k, RW, gl_CooperativeMatrixLayoutColumnMajor);
+				[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+					acc[ib] = coopMatMulAdd(a[ib][k], b, acc[ib]);
+			}
+			[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+				coopMatStore(acc[ib], Ss, (wave * RB + ib) * 16u * SW + j * 4u, SW, gl_CooperativeMatrixLayoutRowMajor);
+		}
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		vec4 pr[RB][4];
+		[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
+			uint r = (wave * RB + ib) * 16u + (lane >> 2);
+			[[unroll]] for (uint c = 0u; c < 4u; c++) {
+				vec4 dots = Ss[r * SW + c * 4u + part];
+				vec4 x = dots * scale[ib] + Ps[c * 4u + part];
+				pr[ib][c] = exp2(x - m[ib]) * s[ib];
+				bsum[ib] += dot(pr[ib][c], dots);
+			}
+		}
+		// Every lane has read its logits: the halves of P may overwrite them.
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
+			uint r = (wave * RB + ib) * 16u + (lane >> 2);
+			[[unroll]] for (uint c = 0u; c < 4u; c++) {
+				uint at = r * SW + c * 2u + (part >> 1);
+				uint comp = (part & 1u) * 2u;
+				Ss[at][comp] = uintBitsToFloat(packHalf2x16(pr[ib][c].xy));
+				Ss[at][comp + 1u] = uintBitsToFloat(packHalf2x16(pr[ib][c].zw));
+			}
+		}
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		[[unroll]] for (uint jc = 0u; jc < 4u; jc++) {
+			coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pa[RB];
+			[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+				coopMatLoad(pa[ib], Ss, (wave * RB + ib) * 16u * SW + 2u * jc, SW, gl_CooperativeMatrixLayoutRowMajor);
+			[[unroll]] for (uint n = 0u; n < DIM / 16; n++) {
+				coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> be;
+				coopMatLoad(be, Bs, jc * 16u * RW + 2u * n, RW, gl_CooperativeMatrixLayoutRowMajor);
+				[[unroll]] for (uint ib = 0u; ib < RB; ib++)
+					dacc[ib][n] = coopMatMulAdd(pa[ib], be, dacc[ib][n]);
+			}
+		}
+		// The next stores of this wave must not land on rows still being read.
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+	}
+
+	// dS: the lanes of a row add their B.
+	[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
+		uint r = (wave * RB + ib) * 16u + (lane >> 2);
+		float B = bsum[ib];
+		for (uint o = 1u; o < 4u; o <<= 1u) {
+			barrier();
+			Ss[slot] = vec4(B, 0.0, 0.0, 0.0);
+			barrier();
+			B += Ss[slot ^ o].x;
+		}
+		if (part == 0u && r0 + r < pc.rows) dS[r0 + r] = (B - dt[ib]) / LN2;
+	}
+	barrier();
+
+	// dO = s (A - e_t) / ln2, with scale = s log2(e): scale (A - e_t).
+	[[unroll]] for (uint ib = 0u; ib < RB; ib++) {
+		uint r = (wave * RB + ib) * 16u + (lane >> 2);
+		[[unroll]] for (uint n = 0u; n < DIM / 16; n++) {
+			coopMatStore(dacc[ib][n], Ss, (wave * RB + ib) * 16u * SW, SW, gl_CooperativeMatrixLayoutRowMajor);
+			subgroupMemoryBarrierShared();
+			subgroupBarrier();
+			vec4 acc = Ss[r * SW + part];
+			uvec4 ev = emb[target[ib] * wv + n * 2u + (part >> 1)];
+			uvec2 w = (part & 1u) == 0u ? ev.xy : ev.zw;
+			vec4 e = vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+			vec4 o = (acc - e) * scale[ib];
+			if (r0 + r < pc.rows) {
+				uint at = (r0 + r) * pc.dim + n * 16u + part * 4u;
+				dO[at] = o.x;
+				dO[at + 1u] = o.y;
+				dO[at + 2u] = o.z;
+				dO[at + 3u] = o.w;
+			}
+			subgroupMemoryBarrierShared();
+			subgroupBarrier();
+		}
+	}
+}

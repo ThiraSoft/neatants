@@ -132,3 +132,45 @@ func (f *Flat) Activate(s *FlatState, inputs []float32) []float32 {
 	learn(v, s.Weight, f.plasticCache)
 	return s.Out
 }
+
+// EdgeGenes returns, for each edge of the network g builds (the From and
+// Weight index of its Flat), the index in g.Conns of the gene it comes from,
+// so that a learner can write the weights it found back into the genome.
+func (g *Genome) EdgeGenes() []int32 {
+	idx := newIDIndex(g.Nodes)
+	defer idx.release()
+	nc := len(g.Nodes)
+	kind := make([]NodeType, nc)
+	for i, node := range g.Nodes {
+		kind[i] = node.Type
+	}
+	// The same slots and the same fill order as BuildNetwork.
+	off := make([]int32, nc*int(NumGates)+1)
+	slots := make([]int, len(g.Conns))
+	for i, c := range g.Conns {
+		slots[i] = -1
+		_, okIn := idx.get(c.In)
+		ti, okOut := idx.get(c.Out)
+		if !c.Enabled || !okIn || !okOut {
+			continue
+		}
+		gate := c.Gate
+		if kind[ti] != Memory || gate >= NumGates {
+			gate = GateIn
+		}
+		slots[i] = ti*int(NumGates) + int(gate)
+		off[slots[i]+1]++
+	}
+	for i := 1; i < len(off); i++ {
+		off[i] += off[i-1]
+	}
+	genes := make([]int32, off[len(off)-1])
+	for i, s := range slots {
+		if s < 0 {
+			continue
+		}
+		genes[off[s]] = int32(i)
+		off[s]++
+	}
+	return genes
+}

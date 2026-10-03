@@ -213,3 +213,62 @@ func BenchmarkDenseNet200D64(b *testing.B)       { benchDense(b, "prep64.bin", 6
 func BenchmarkDenseNet200D32(b *testing.B)       { benchDense(b, "prep32.bin", 32, "net") }
 func BenchmarkDensePop200D32State4(b *testing.B) { benchDenseState(b, "prep32.bin", 32, 4, "") }
 func BenchmarkDenseNet200D32State4(b *testing.B) { benchDenseState(b, "prep32.bin", 32, 4, "net") }
+
+// benchGradOn times, for the population of realistic genomes at pop n, the
+// xent kernel alone (Evaluate) and the fused kernel alone (EvaluateGrad
+// without the readback), each as the GPU time of the submission.
+func benchGradOn(b *testing.B, file string, dim, n int, grad bool) {
+	d, err := prep.Load("../../../data/" + file)
+	if err != nil {
+		b.Skipf("no data/%s", file)
+	}
+	dev, err := vk.Open()
+	if err != nil {
+		b.Skip(err)
+	}
+	defer dev.Close()
+	defer func(k int) { neat.MinimalLinks = k }(neat.MinimalLinks)
+	neat.MinimalLinks = dim
+	gs := make_pop(n, d.Dim, func(i, dim int) *neat.Genome {
+		g := model.NewGenomeShape(i+1, model.Shape{Dim: dim})
+		for range 3 {
+			g.Mutate()
+		}
+		return g
+	})
+	e, err := New(dev, d)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer e.Close()
+	e.skipNet, e.skipCopy = true, os.Getenv("GRADCOPY") == ""
+	rng := rand.New(rand.NewSource(1))
+	// netrun is left out, so the rows are whatever the buffer holds: the
+	// kernels' cost does not depend on them.
+	starts := model.DrawStarts(rng, len(d.Train), 4, 128)
+	run := func() {
+		var err error
+		if grad {
+			_, _, _, _, _, err = e.EvaluateGrad(gs, starts, 128, 16)
+		} else {
+			_, _, err = e.Evaluate(gs, starts, 128, 16)
+		}
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	run()
+	b.ResetTimer()
+	var gpu time.Duration
+	for range b.N {
+		run()
+		gpu += e.Timing.GPU
+	}
+	b.ReportMetric(float64(gpu.Milliseconds())/float64(b.N), "ms-gpu")
+	b.ReportMetric(float64(n*4*112), "rows")
+}
+
+func BenchmarkXentD32Pop200(b *testing.B)       { benchGradOn(b, "prep32.bin", 32, 200, false) }
+func BenchmarkXentGradD32Pop200(b *testing.B)   { benchGradOn(b, "prep32.bin", 32, 200, true) }
+func BenchmarkXentD128Pop1000(b *testing.B)     { benchGradOn(b, "prep.bin", 128, 1000, false) }
+func BenchmarkXentGradD128Pop1000(b *testing.B) { benchGradOn(b, "prep.bin", 128, 1000, true) }

@@ -55,6 +55,10 @@ type Evaluator struct {
 	// skipNet and skipXent leave a kernel out of the submission, so that a
 	// benchmark can time the other one alone. Tests only.
 	skipNet, skipXent bool
+	// skipCopy leaves the readback of the gradient out of EvaluateGrad.
+	skipCopy bool
+	// grad is the state of EvaluateGrad, built on first use.
+	grad gradState
 	// coop says that xent runs on the matrix cores.
 	coop bool
 
@@ -171,6 +175,7 @@ func packHalves(x []float32) []uint32 {
 // Close releases the sets, the pipelines and every buffer.
 func (e *Evaluator) Close() {
 	e.dropSets()
+	e.grad.close()
 	for _, p := range []*vk.Pipeline{e.netPipe[0], e.netPipe[1], e.xentPipe, e.treePipe} {
 		if p != nil {
 			p.Close()
@@ -187,6 +192,7 @@ func (e *Evaluator) Close() {
 }
 
 func (e *Evaluator) dropSets() {
+	e.grad.dropSets()
 	for i := range e.netSet {
 		for c := range e.netSet[i] {
 			if e.netSet[i][c] != nil {
@@ -265,13 +271,13 @@ func (e *Evaluator) grow(upBytes, genBytes, rowBytes, bitBytes int) error {
 // The genomes must not be changed in place afterwards: the next call compares
 // copies of them with them to reuse their records (copies may be changed).
 func (e *Evaluator) Evaluate(gs []*neat.Genome, starts []int, length, warm int) (bpb []float64, oversized int, err error) {
-	return e.evaluate(gs, 0, e.data.Train, starts, length, warm)
+	return e.evaluate(gs, 0, e.data.Train, starts, length, warm, nil)
 }
 
 // Validate scores one genome on the fixed validation windows.
 func (e *Evaluator) Validate(g *neat.Genome) (float64, error) {
 	ids := e.data.Val
-	bpb, over, err := e.evaluate([]*neat.Genome{g}, 1, ids, model.ValStarts(len(ids)), model.ValLen, model.Warm)
+	bpb, over, err := e.evaluate([]*neat.Genome{g}, 1, ids, model.ValStarts(len(ids)), model.ValLen, model.Warm, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -281,7 +287,7 @@ func (e *Evaluator) Validate(g *neat.Genome) (float64, error) {
 	return bpb[0], nil
 }
 
-func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []int, length, warm int) ([]float64, int, error) {
+func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []int, length, warm int, grad *gradOut) ([]float64, int, error) {
 	d := e.data
 	start := time.Now()
 	// The kernel finds the banks of a network from its inputs, so a genome
@@ -318,6 +324,9 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 			scales = append(scales, model.LogitScale(gs[i], d.Dim))
 		}
 	}
+	if grad != nil {
+		grad.fit = fitIdx
+	}
 	if len(recs) == 0 {
 		e.Timing.Pack, e.Timing.GPU, e.Timing.Sum = time.Since(start), 0, 0
 		return bpb, over, nil
@@ -335,6 +344,10 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 			rows, e.xentRows*maxGroups)
 	}
 
+	if grad != nil && (rows+xentGradRows-1)/xentGradRows > maxGroups {
+		return nil, 0, fmt.Errorf("gpu: %d rows to score, over what one dispatch of xent_grad covers (%d): lower -pop, -windows or -len",
+			rows, xentGradRows*maxGroups)
+	}
 	genBytes := 4 * layoutSize(recs, len(starts))
 	if (rows+treeRows-1)/treeRows > maxGroups {
 		return nil, 0, fmt.Errorf("gpu: %d rows to score, over what one dispatch of tree covers (%d): lower -pop, -windows or -len",
@@ -342,6 +355,11 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 	}
 	if err := e.grow(genBytes, genBytes, rows*((outs+1)/2)*4, rows*4); err != nil {
 		return nil, 0, err
+	}
+	if grad != nil {
+		if err := e.gradReady(kind, rows); err != nil {
+			return nil, 0, err
+		}
 	}
 	// The records go straight into the staging buffer.
 	up := unsafe.Slice((*uint32)(unsafe.Pointer(&e.up.Bytes()[0])), genBytes/4)
@@ -361,6 +379,8 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 			tp := treePush{uint32(rows), uint32(outs), uint32(scored), uint32(len(starts)), uint32(warm),
 				uint32(gen.startsOff), uint32(gen.scaleOff)}
 			r.Dispatch(e.treeSet[kind], uint32((rows+treeRows-1)/treeRows), unsafe.Pointer(&tp))
+		} else if grad != nil {
+			e.recordGrad(r, kind, rows, unsafe.Pointer(&xp))
 		} else if !e.skipXent {
 			groups := uint32((rows + e.xentRows - 1) / e.xentRows)
 			if e.coop {
@@ -390,6 +410,12 @@ func (e *Evaluator) evaluate(gs []*neat.Genome, kind int, ids []int32, starts []
 			return nil, 0, fmt.Errorf("gpu: xent returned NaN for genome %d: the matrix kernel ran at the wrong wave width, set NEATTEXT_SCALAR_XENT=1", i)
 		}
 		bpb[i] = sum / denom
+	}
+	if grad != nil && !e.skipCopy {
+		grad.dO = make([]float32, rows*d.Dim)
+		copy(grad.dO, unsafe.Slice((*float32)(unsafe.Pointer(&e.grad.dOrd.Bytes()[0])), rows*d.Dim))
+		grad.dS = make([]float32, rows)
+		copy(grad.dS, unsafe.Slice((*float32)(unsafe.Pointer(&e.grad.dSrd.Bytes()[0])), rows))
 	}
 	e.Timing.Sum = time.Since(start)
 	return bpb, over, nil

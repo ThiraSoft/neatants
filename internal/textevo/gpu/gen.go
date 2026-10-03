@@ -7,3 +7,7 @@ package gpu
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DDIM=64 xent_coop.comp -o xent_coop64.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DDIM=32 xent_coop.comp -o xent_coop32.spv
 //go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute tree.comp -o tree.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute xent_grad.comp -o xent_grad.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DDIM=32 xent_grad_coop.comp -o xent_grad_coop32.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DDIM=64 xent_grad_coop.comp -o xent_grad_coop64.spv
+//go:generate glslc -O --target-env=vulkan1.1 -fshader-stage=compute -DDIM=128 xent_grad_coop.comp -o xent_grad_coop128.spv

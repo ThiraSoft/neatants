@@ -83,3 +83,28 @@ func TestFlatOrderIsStableByLevel(t *testing.T) {
 		}
 	}
 }
+
+func TestEdgeGenes(t *testing.T) {
+	for seed := range int64(20) {
+		rand.Seed(seed)
+		g := NewGenome(1, 6, 4)
+		for range 200 {
+			g.Mutate()
+		}
+		g.AddMemory()
+		g.AddMemory()
+		if len(g.Conns) > 3 {
+			g.Conns[2].Enabled = false
+		}
+		f := g.BuildNetwork().Flat()
+		genes := g.EdgeGenes()
+		if len(genes) != len(f.Weight) {
+			t.Fatalf("seed %d: %d genes for %d edges", seed, len(genes), len(f.Weight))
+		}
+		for k, i := range genes {
+			if float32(g.Conns[i].Weight) != f.Weight[k] || !g.Conns[i].Enabled {
+				t.Fatalf("seed %d edge %d: gene %d weight %g, edge %g", seed, k, i, g.Conns[i].Weight, f.Weight[k])
+			}
+		}
+	}
+}

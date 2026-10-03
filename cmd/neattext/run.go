@@ -17,6 +17,7 @@ import (
 	"github.com/ThiraSoft/golem/vk"
 	"github.com/ThiraSoft/neatants/internal/textevo/evo"
 	"github.com/ThiraSoft/neatants/internal/textevo/gpu"
+	"github.com/ThiraSoft/neatants/internal/textevo/learn"
 	"github.com/ThiraSoft/neatants/internal/textevo/model"
 	"github.com/ThiraSoft/neatants/internal/textevo/prep"
 	"github.com/ThiraSoft/neatants/internal/textevo/ref"
@@ -53,7 +54,7 @@ func (c cpuEval) eval(gs []*neat.Genome, ids []int32, starts []int, length, warm
 	return ref.Evaluate(gs, c.d, ids, starts, length, warm)
 }
 
-var header = []string{"gen", "best_bpb", "mean_bpb", "species", "nodes", "edges", "memory", "plastic", "oversized", "eval_ms", "total_ms", "val_bpb"}
+var header = []string{"gen", "best_bpb", "mean_bpb", "species", "nodes", "edges", "memory", "plastic", "oversized", "eval_ms", "total_ms", "val_bpb", "learn_ms"}
 
 func runEvolve() {
 	if *warm >= *length {
@@ -79,6 +80,9 @@ func runEvolve() {
 	}
 	if *score != "softmax" && *score != "tree" {
 		fail(2, "-score must be softmax or tree")
+	}
+	if *learnOn && *score != "softmax" {
+		fail(2, "-learn needs -score softmax")
 	}
 	if *input != model.InputEmb && *input != model.InputCode && *input != model.InputBoth {
 		fail(2, "-input must be emb, code or both")
@@ -115,6 +119,7 @@ func runEvolve() {
 	}
 
 	var ev evaluator = cpuEval{rows, tr}
+	var gev *gpu.Evaluator
 	if !*cpu {
 		dev, err := vk.Open()
 		if err != nil {
@@ -131,7 +136,7 @@ func runEvolve() {
 			fail(1, "%v", err)
 		}
 		defer ge.Close()
-		ev = ge
+		ev, gev = ge, ge
 	}
 
 	dir := *out
@@ -177,11 +182,18 @@ func runEvolve() {
 	for gen := 1; ; gen++ {
 		t0 := time.Now()
 		starts := model.DrawStarts(rng, len(d.Train), *windows, *length)
-		bpb, over, err := ev.Evaluate(p.Genomes, starts, *length, *warm)
-		if err != nil {
-			fail(1, "generation %d: %v", gen, err)
+		var bpb []float64
+		var over int
+		var learnTime time.Duration
+		if *learnOn {
+			bpb, over, learnTime = learnStep(p.Genomes, gev, d, starts)
+		} else {
+			bpb, over, err = ev.Evaluate(p.Genomes, starts, *length, *warm)
+			if err != nil {
+				fail(1, "generation %d: %v", gen, err)
+			}
 		}
-		evalTime := time.Since(t0)
+		evalTime := time.Since(t0) - learnTime
 		fit := make([]float64, len(bpb))
 		best, mean, finite := math.Inf(1), 0.0, 0
 		for i, b := range bpb {
@@ -225,7 +237,8 @@ func runEvolve() {
 		}
 		row := []string{strconv.Itoa(gen), num(best), num(mean), strconv.Itoa(len(p.Species)),
 			strconv.Itoa(flat.Nodes()), strconv.Itoa(len(flat.From)), strconv.Itoa(memory), strconv.Itoa(len(flat.Plastic)),
-			strconv.Itoa(over), strconv.FormatInt(evalTime.Milliseconds(), 10), strconv.FormatInt(time.Since(t0).Milliseconds(), 10), val}
+			strconv.Itoa(over), strconv.FormatInt(evalTime.Milliseconds(), 10), strconv.FormatInt(time.Since(t0).Milliseconds(), 10), val,
+			strconv.FormatInt(learnTime.Milliseconds(), 10)}
 		w.Write(row)
 		w.Flush()
 		fmt.Println(strings.Join(row, ","))
@@ -249,4 +262,45 @@ func save(dir string, c champion) error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(dir, "champion.json"))
+}
+
+// learnStep scores every genome on the windows at starts, then replaces each
+// with a copy that took one step of gradient descent on the same windows
+// (Lamarckian learning: the children inherit the learned weights). The bpb
+// returned are those before the step, so the fitness never saw the windows
+// it is judged on. On the card the softmax and its gradient run there and
+// only the backward pass through the networks runs here; with -cpu all of it
+// runs on the CPU. learnTime is the part spent in the backward pass.
+func learnStep(gs []*neat.Genome, gev *gpu.Evaluator, d *prep.Data, starts []int) (bpb []float64, over int, learnTime time.Duration) {
+	var fit []int
+	var grads []learn.Grad
+	if gev != nil {
+		var dO, dS []float32
+		var err error
+		bpb, over, fit, dO, dS, err = gev.EvaluateGrad(gs, starts, *length, *warm)
+		if err != nil {
+			fail(1, "%v", err)
+		}
+		t0 := time.Now()
+		grads = learn.FromRows(gs, fit, d, d.Train, starts, *length, *warm, dO, dS)
+		learnTime = time.Since(t0)
+	} else {
+		t0 := time.Now()
+		bpb, grads = learn.Gradient(gs, d, d.Train, starts, *length, *warm)
+		learnTime = time.Since(t0)
+		fit = make([]int, len(gs))
+		for i := range fit {
+			fit[i] = i
+		}
+	}
+	t0 := time.Now()
+	for j, i := range fit {
+		c := learn.Apply(gs[i], grads[j], *lrW, *lrEta, *lrTrait)
+		// A learned genome is a new one: no record to reuse, no lives to
+		// average its fitness with.
+		c.Origin, c.Evals = 0, 0
+		gs[i] = c
+	}
+	learnTime += time.Since(t0)
+	return bpb, over, learnTime
 }
